@@ -347,8 +347,11 @@ number and a reference code filled in.
      on, Source **URL parameter**, Parameter name `claim`.
    - **Reference**: Short text -> Reference column. Pre-fill on, URL parameter,
      Parameter name `ref`. **Hidden.**
-   - Payment method, bank details (shown only for direct deposit), mailing
-     address (for checks).
+   - Payment method, bank details and an optional voided-check upload (shown only
+     for direct deposit), and the mailing address (for checks). A claimant who
+     doesn't upload a voided check ticks a box accepting counsel's terms instead.
+     The full question list, help text and a placeholder for those terms are in
+     `docs/templates/payment-form.md`.
    The parameter names are what you type in the pre-fill setting, not the question
    titles or column ids. Use Short text for both: other question types don't
    pre-fill reliably.
@@ -415,7 +418,9 @@ record for the main domain (section 3) covers this subdomain too.
 
 **Payments > Documents & Contracts > Templates > New template.**
 
-- Body: the settlement and release wording **from counsel**. Insert merge fields
+- Body: the settlement and release wording **from counsel**. A placeholder
+  structure with the merge fields already in place is in
+  `docs/templates/settlement-agreement.md`. Insert merge fields
   with the Merge Fields picker: contact name, `{{contact.claim_number}}`,
   `{{contact.settlement_amount}}` (already formatted like `$1,250.00`), and the
   date.
@@ -684,7 +689,13 @@ text, and texting STATUS should get a reply.
 ## 11. Launch checklist
 
 - [ ] **Counsel has reviewed** the privacy policy, terms of use (including SMS
-      terms), the settlement agreement template and the e-signature consent text.
+      terms), the settlement agreement template and the e-signature consent text,
+      and provided the no-voided-check terms for the payment form.
+- [ ] **No placeholders left**: search the site and templates for `[` (legal
+      entity name, mailing address, effective date, retention period, governing
+      law state in `src/web/site-info.ts`; the bracketed items in
+      `docs/templates/*.md`), and confirm `contactEmail` in `site-info.ts` is the
+      real public mailbox.
 - [ ] The bracketed placeholders on the privacy and terms pages (legal entity name,
       mailing address, effective date, retention period, governing law) are filled
       in. They live in `src/web/site-info.ts`; ask the developer to update and
