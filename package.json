@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "node dist/src/server.js",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && rm -rf dist/src/web/static && cp -r src/web/static dist/src/web/static",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
