@@ -59,6 +59,7 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
 
   // The only URLs an email turns into links: our site and the payment form.
   const linkPrefixes = [config.PUBLIC_BASE_URL, urlPrefix(board.paymentForm.url)].filter(Boolean);
+  const logoUrl = `${config.PUBLIC_BASE_URL.replace(/\/+$/, '')}/static/brand/email-logo.png`;
 
   const smsAllowed = (c: Claim): boolean => config.SMS_ENABLED && c.smsOptIn && !c.smsOptedOut && !!c.phone?.trim();
 
@@ -281,7 +282,7 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
       const subject = services.templates.render(t.emailSubject, v).replace(/\s+/g, ' ').trim();
       const buttons: EmailButton[] = NO_CLAIM_LINK_TEMPLATE_KEYS.has(key) ? [] : [{ url: v.portalUrl, label: 'View your claim' }];
       if (v.paymentFormUrl) buttons.push({ url: v.paymentFormUrl, label: 'Choose how to be paid' });
-      const content = { subject, bodyText: services.templates.render(t.emailBody, v), claimNumber: c.claimNumber, buttons, linkPrefixes };
+      const content = { subject, bodyText: services.templates.render(t.emailBody, v), claimNumber: c.claimNumber, buttons, linkPrefixes, logoUrl };
       // A failure here propagates so the job retries; channels already sent are skipped then.
       await highlevel.sendEmail({ contactId, subject, html: renderEmailHtml(content), text: renderEmailText(content) });
       if (emailKey) repo.markEventProcessed(emailKey);

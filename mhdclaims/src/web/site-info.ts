@@ -7,8 +7,9 @@ export const SITE = {
   // The delivery service these claims are for. Shown only as a "you're in the
   // right place" hint; set to '' to leave it off the site.
   deliveryCompanyName: 'My Home Delivery',
-  // The company that operates the site and decides claims ("we" in the legal pages).
-  legalEntityName: '[Claims entity legal name]',
+  // The company that operates the site and decides claims ("we" in the legal pages),
+  // as shown on the logo.
+  legalEntityName: 'HomeDeliveryClaims.com LLC',
   // Placeholder until the client confirms the public contact mailbox.
   contactEmail: 'claims@homedeliveryclaims.com',
   mailingAddress: '[Mailing address: street, city, state, ZIP]',
@@ -18,6 +19,9 @@ export const SITE = {
   retentionPeriod: '[Retention period]',
   // State whose law governs the Terms of Use.
   governingLawState: '[State]',
+  // The logo's descriptor and tagline, shown in the footer.
+  descriptor: 'Property damage claims management',
+  tagline: 'From delivery to resolution\u2122',
   // The text-message program as registered for A2P 10DLC.
   smsProgramName: 'Home Delivery Claims claim updates',
 } as const;

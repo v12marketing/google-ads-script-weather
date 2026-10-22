@@ -28,17 +28,17 @@ export const icon = (name: IconName, cls = 'icon'): Html =>
 export const heroArt = raw(`<svg viewBox="0 0 340 260" width="340" height="260" aria-hidden="true" focusable="false">
   <circle cx="186" cy="130" r="112" fill="#ffffff" opacity="0.75"/>
   <path d="M22 226h286" stroke="#b9c8d6" stroke-width="4" stroke-linecap="round"/>
-  <path d="M124 118v108h138V118" fill="#ffffff" stroke="#0b3d5c" stroke-width="6" stroke-linejoin="round"/>
-  <path d="M106 128 193 60l87 68" fill="none" stroke="#0b3d5c" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="140" y="140" width="28" height="26" rx="3" fill="#cfe3f0"/>
-  <rect x="214" y="140" width="28" height="26" rx="3" fill="#cfe3f0"/>
-  <rect x="176" y="166" width="34" height="60" rx="3" fill="#0b3d5c"/>
+  <path d="M124 118v108h138V118" fill="#ffffff" stroke="#02244d" stroke-width="6" stroke-linejoin="round"/>
+  <path d="M106 128 193 60l87 68" fill="none" stroke="#02244d" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="140" y="140" width="28" height="26" rx="3" fill="#d6e6f5"/>
+  <rect x="214" y="140" width="28" height="26" rx="3" fill="#d6e6f5"/>
+  <rect x="176" y="166" width="34" height="60" rx="3" fill="#02244d"/>
   <g>
     <path d="M34 168h80l4 58H30z" fill="#d9a066"/>
     <path d="M34 168h80l-4 16H38z" fill="#c78d52"/>
     <rect x="65" y="168" width="18" height="58" fill="#f1d3ad"/>
     <path d="M97 192l7 9-6 9 6 9" fill="none" stroke="#7a4f22" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
-  <circle cx="276" cy="72" r="32" fill="#0c7a70"/>
+  <circle cx="276" cy="72" r="32" fill="#0f71b9" stroke="#fdbf1a" stroke-width="5"/>
   <path d="m261 73 10 10 20-21" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`);

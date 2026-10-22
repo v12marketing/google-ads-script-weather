@@ -182,7 +182,9 @@ describe('notify', () => {
     const claim = makeClaim(ctx);
     await notifier.notify(claim, 'new_message', { message: '<script>alert("hi")</script> & <b>bold</b>\nhttps://evil.test/"><img src=x>' });
     const mail = highlevel.emails[0]!;
-    expect(mail.html).not.toMatch(/<script|<b>|<img/);
+    expect(mail.html).not.toMatch(/<script|<b>|<img src=x/);
+    // The only image is our own logo.
+    expect(mail.html.match(/<img\b[^>]*>/g)).toEqual([expect.stringContaining('src="https://claims.test/static/brand/email-logo.png"')]);
     expect(mail.html).toContain('&lt;script&gt;alert(&quot;hi&quot;)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;');
     // Not our site: shown as text, never made a link.
     expect(mail.html).not.toContain('href="https://evil.test');

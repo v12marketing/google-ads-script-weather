@@ -1,4 +1,5 @@
 import { html, raw, type Html } from './html.js';
+import { SITE } from './site-info.js';
 
 export const SITE_NAME = 'Home Delivery Claims';
 
@@ -36,7 +37,11 @@ export function page(o: PageOptions): string {
 <title>${title}</title>
 ${o.description ? html`<meta name="description" content="${o.description}">` : ''}
 ${o.noindex ? raw('<meta name="robots" content="noindex, nofollow">') : ''}
+<meta name="theme-color" content="#02244d">
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
+<link rel="preload" href="/static/fonts/open-sans-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/montserrat-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/static/site.css">
 ${(o.styles ?? []).map((s) => html`<link rel="stylesheet" href="/static/${s}">`)}
 ${(o.scripts ?? []).map((s) => html`<script src="/static/${s}" defer></script>`)}
@@ -45,7 +50,7 @@ ${(o.scripts ?? []).map((s) => html`<script src="/static/${s}" defer></script>`)
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
   <div class="wrap header-inner">
-    <a class="brand" href="/">${SITE_NAME}</a>
+    <a class="brand" href="/"><img src="/static/brand/logo.webp" width="505" height="200" alt="${SITE.domain} home"></a>
     ${
       o.minimalHeader
         ? ''
@@ -63,8 +68,10 @@ ${o.body}
 </main>
 <footer class="site-footer">
   <div class="wrap">
+    <p class="footer-brand">${SITE.domain}</p>
+    <p class="footer-tagline">${SITE.descriptor} · ${SITE.tagline}</p>
     <nav aria-label="Legal"><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/faq">FAQ</a></nav>
-    <p>&copy; ${new Date().getFullYear()} ${SITE_NAME}</p>
+    <p>&copy; ${new Date().getFullYear()} ${SITE.legalEntityName}</p>
   </div>
 </footer>
 </body>

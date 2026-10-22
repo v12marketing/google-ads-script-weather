@@ -8,14 +8,19 @@ import { escapeHtml, html, raw, type Html } from '../web/html.js';
 // claimant can't turn into a clickable link in an email from us.
 
 const BRAND = 'Home Delivery Claims';
-const FONT = raw("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif");
-const INK = '#12233a';
-const INK_SOFT = '#4a5a70';
-const BRAND_BG = '#0b3d5c';
-// Darker than the site accent so white button text passes WCAG AA contrast.
-const BUTTON_BG = '#0c7a70';
-const PAGE_BG = '#f4f7fa';
-const LINE = '#dbe3ec';
+const LOGO_ALT = 'HomeDeliveryClaims.com';
+// Web fonts are unreliable in email clients; Open Sans shows where installed.
+const FONT = raw("'Open Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif");
+// Brand colors from the logo, as on the site.
+const INK = '#1c2b40';
+const INK_SOFT = '#4f5d70';
+const NAVY = '#02244d';
+const GOLD = '#fdbf1a';
+// White text on this blue passes WCAG AA contrast.
+const BUTTON_BG = '#0f71b9';
+const LINK = '#0b5f9e';
+const PAGE_BG = '#f5f8fc';
+const LINE = '#dde5ef';
 
 export interface EmailButton {
   url: string;
@@ -34,6 +39,8 @@ export interface EmailContent {
   // origin, and the prefix's path or below it), e.g. PUBLIC_BASE_URL and the
   // payment form URL. Without it, no URL in the text is linked.
   linkPrefixes?: string[];
+  // Absolute URL of the logo image for the header; without it the header is text.
+  logoUrl?: string;
 }
 
 type LinkCheck = (url: string) => boolean;
@@ -75,7 +82,7 @@ const isClaimPageUrl = (url: string): boolean => {
 };
 
 const link = (url: string): Html =>
-  html`<a href="${url}" style="color:${BRAND_BG};text-decoration:underline;word-break:break-all;">${url}</a>`;
+  html`<a href="${url}" style="color:${LINK};text-decoration:underline;word-break:break-all;">${url}</a>`;
 
 // Escapes text and links its allowed http(s) URLs, leaving trailing punctuation outside the link.
 function linkify(text: string, allowed: LinkCheck): Html {
@@ -162,7 +169,11 @@ export function renderEmailHtml(c: EmailContent): string {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAGE_BG};">
 <tr><td align="center" style="padding:24px 12px;">
 <table role="presentation" class="container" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;background:#ffffff;border:1px solid ${LINE};border-radius:10px;">
-<tr><td class="px" style="background:${BRAND_BG};padding:18px 32px;border-radius:10px 10px 0 0;font-family:${FONT};font-size:19px;font-weight:700;letter-spacing:0.01em;color:#ffffff;">${BRAND}</td></tr>
+<tr><td class="px" style="background:#ffffff;padding:20px 32px 16px;border-bottom:3px solid ${GOLD};border-radius:10px 10px 0 0;font-family:${FONT};font-size:19px;font-weight:700;letter-spacing:0.01em;color:${NAVY};">${
+      c.logoUrl
+        ? html`<img src="${c.logoUrl}" width="200" height="79" alt="${LOGO_ALT}" style="display:block;width:200px;height:auto;max-width:100%;border:0;">`
+        : BRAND
+    }</td></tr>
 <tr><td class="px" style="padding:28px 32px 12px;font-family:${FONT};font-size:16px;line-height:1.6;color:${INK};">
 ${bodyHtml(c.bodyText, buttons, linkCheck(c.linkPrefixes))}
 </td></tr>

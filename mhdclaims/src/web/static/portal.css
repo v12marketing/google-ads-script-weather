@@ -70,7 +70,7 @@
 .thread { list-style: none; margin: 0 0 20px; padding: 0; display: flex; flex-direction: column; gap: 12px; }
 .msg { max-width: 92%; border-radius: var(--radius); padding: 10px 14px; border: 1px solid var(--line); }
 .msg-team { align-self: flex-start; background: var(--bg-soft); }
-.msg-you { align-self: flex-end; background: var(--accent-soft); border-color: #bfe5e0; }
+.msg-you { align-self: flex-end; background: var(--accent-soft); border-color: #c6dcf0; }
 .msg-meta { font-size: 0.85rem; color: var(--ink-soft); margin-bottom: 4px; }
 .msg-meta strong { color: var(--ink); margin-right: 6px; }
 .msg-body p { margin: 0 0 8px; overflow-wrap: anywhere; }

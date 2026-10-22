@@ -11,7 +11,7 @@ const PAGES: Array<{ path: string; title: string; contains: string[] }> = [
   { path: '/start-a-claim', title: 'Start a claim | Home Delivery Claims', contains: ['Have these ready', '<iframe', 'Form not loading?', 'claim number', 'Reply STOP to cancel'] },
   { path: '/how-it-works', title: 'How it works | Home Delivery Claims', contains: ['More information needed', 'Estimate in progress', 'Settlement offered', 'Payment sent', '6-digit code', 'Text STATUS'] },
   { path: '/faq', title: 'Frequently asked questions | Home Delivery Claims', contains: ['<details', 'Is my bank information safe?', 'How do I stop texts?'] },
-  { path: '/privacy', title: 'Privacy Policy | Home Delivery Claims', contains: ['DRAFT for counsel review', SMS_PRIVACY_STATEMENT, '[Claims entity legal name]'] },
+  { path: '/privacy', title: 'Privacy Policy | Home Delivery Claims', contains: ['DRAFT for counsel review', SMS_PRIVACY_STATEMENT, 'HomeDeliveryClaims.com LLC'] },
   { path: '/terms', title: 'Terms of Use | Home Delivery Claims', contains: ['DRAFT for counsel review', 'id="sms-terms"', 'Home Delivery Claims claim updates', 'Message frequency varies', 'Message and data rates may apply', 'Carriers are not liable', 'href="/privacy'] },
   { path: '/find-my-claim', title: 'Find my claim | Home Delivery Claims', contains: ['<form', 'name="email"', 'autocomplete="email"'] },
 ];
