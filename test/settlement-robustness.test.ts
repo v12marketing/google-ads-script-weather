@@ -346,3 +346,102 @@ describe("the claimant's signing link (#10)", () => {
     expect(t.portalText).toMatch(/spam or junk folder/);
   });
 });
+
+describe("a settlement out while the claimant's email changes", () => {
+  // An email-only claim: a new email can't match the old contact, so the claim
+  // moves to another HighLevel contact, while the document stays with the old one.
+  async function sentThenMoved(env: TestEnv) {
+    const item = await newClaim(env, { email: 'jane@example.com', phone: '', settlement: '900' });
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, item.id));
+    const sentTo = claimOf(env, item.id).highlevelContactId!;
+    const documentId = env.ctx.repo.getSettlementRefs(item.id).documentId!;
+    env.monday.setText(item.id, env.board.columns.email, 'jane.doe@work.example', 'email');
+    await env.ctx.services.intake.refreshClaim(item.id);
+    const movedTo = claimOf(env, item.id).highlevelContactId!;
+    expect(movedTo).not.toBe(sentTo);
+    expect(claimOf(env, item.id).settlementContactId).toBe(sentTo);
+    return { item, sentTo, documentId };
+  }
+
+  it('tells the team once that the open document stayed with the old details', async () => {
+    const env = makeTestEnv();
+    const { item } = await sentThenMoved(env);
+    const notes = updatesOn(env, item.id).filter((u) => u.includes("as they were before this change"));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('the signature will be recognised');
+    env.monday.setText(item.id, env.board.columns.email, 'jane.d@home.example', 'email');
+    await env.ctx.services.intake.refreshClaim(item.id);
+    expect(updatesOn(env, item.id).filter((u) => u.includes('as they were before this change'))).toHaveLength(1);
+  });
+
+  it('still recognises the signature: from the webhook of the contact it went to', async () => {
+    const env = makeTestEnv();
+    const { item, sentTo, documentId } = await sentThenMoved(env);
+    env.highlevel.sign(documentId);
+    await env.ctx.services.settlement.handleDocumentSigned({ kind: 'document_signed', contactId: sentTo, documentId: null, claimNumber: claimOf(env, item.id).claimNumber });
+    expect(claimOf(env, item.id).settlementSignedAt).not.toBeNull();
+    expect(updatesOn(env, item.id).filter((u) => u.startsWith('Settlement signed by the claimant'))).toHaveLength(1);
+  });
+
+  it('still recognises the signature: from the poller', async () => {
+    const env = makeTestEnv();
+    const { item, sentTo, documentId } = await sentThenMoved(env);
+    env.highlevel.sign(documentId);
+    await env.ctx.services.settlement.reconcilePending();
+    expect(claimOf(env, item.id).settlementSignedAt).not.toBeNull();
+    expect(verifyCalls(env).at(-1)!.args[1]).toBe(sentTo);
+  });
+
+  it('set again for the same amount: no second document, and the team hears where the open one went', async () => {
+    const env = makeTestEnv();
+    const { item } = await sentThenMoved(env);
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, item.id));
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, item.id));
+    expect(env.highlevel.settlementRequests).toHaveLength(1);
+    const notes = updatesOn(env, item.id).filter((u) => u.includes('before they were changed on this item'));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('void it in HighLevel');
+  });
+
+  it('set again for a new amount after the claimant signed: the signature stands, no second document', async () => {
+    const env = makeTestEnv();
+    const { item, documentId } = await sentThenMoved(env);
+    env.highlevel.sign(documentId);
+    env.monday.setText(item.id, env.board.columns.settlementAmount, '950', 'numbers');
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, item.id));
+    expect(env.highlevel.settlementRequests.map((r) => r.settlementAmount)).toEqual([900]);
+    expect(claimOf(env, item.id).settlementSignedAt).not.toBeNull();
+    expect(updatesOn(env, item.id).at(-1)).toMatch(/had already signed the earlier settlement document for \$900\.00/);
+  });
+
+  it('a send of unknown outcome is still found with the contact it went to', async () => {
+    const env = makeTestEnv();
+    const item = await newClaim(env, { email: 'jane@example.com', phone: '', settlement: '900' });
+    env.highlevel.failAfterSend = 1;
+    await expect(env.ctx.services.settlement.sendSettlement(claimOf(env, item.id))).rejects.toThrow(/timeout/);
+    const sentTo = claimOf(env, item.id).settlementAttemptContactId;
+    expect(sentTo).toBe(claimOf(env, item.id).highlevelContactId);
+    env.monday.setText(item.id, env.board.columns.email, 'jane.doe@work.example', 'email');
+    await env.ctx.services.intake.refreshClaim(item.id);
+    expect(claimOf(env, item.id).highlevelContactId).not.toBe(sentTo);
+
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, item.id));
+    expect(env.highlevel.settlementRequests).toHaveLength(1);
+    expect(claimOf(env, item.id)).toMatchObject({ settlementContactId: sentTo, settlementAttemptAt: null, settlementAttemptContactId: null });
+    expect(env.ctx.repo.getSettlementRefs(item.id).documentId).toBe([...env.highlevel.documents.keys()][0]);
+  });
+
+  it("the one-open-settlement rule follows the document's contact, not the claim's", async () => {
+    const env = makeTestEnv();
+    const { item } = await sentThenMoved(env);
+    // Another claim on the old address (its contact holds the open document's fields) waits...
+    const old = await newClaim(env, { name: 'Jane Doe', email: 'jane@example.com', phone: '', settlement: '400' });
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, old.id));
+    expect(updatesOn(env, old.id).at(-1)).toMatch(/already has a settlement waiting for signature/);
+    // ...while one on the new address doesn't.
+    const fresh = await newClaim(env, { name: 'Jane Doe', email: 'jane.doe@work.example', phone: '', settlement: '300' });
+    expect(claimOf(env, fresh.id).highlevelContactId).toBe(claimOf(env, item.id).highlevelContactId);
+    await env.ctx.services.settlement.sendSettlement(claimOf(env, fresh.id));
+    expect(env.highlevel.settlementRequests.map((r) => r.settlementAmount)).toEqual([900, 300]);
+  });
+});

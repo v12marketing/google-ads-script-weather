@@ -481,6 +481,23 @@ describe('portal: claim page', () => {
     expect(paid.map(([, state]) => state)).toEqual(['done', 'done', 'done', 'done', 'done']);
   });
 
+  it('shows settlement and payment done on a closed claim whose signature the team recorded on the board', async () => {
+    const t = await setup({ statusKey: 'closed', statusLabel: 'Closed' });
+    const { repo } = t.env.ctx;
+    for (const label of ['Under review', 'Settlement offered', 'Settlement signed', 'Payment sent', 'Closed']) {
+      repo.addMessage({ itemId: t.claim.itemId, direction: 'system', channel: 'monday', body: `Status updated: ${label}` });
+    }
+    expect(repo.getClaim(t.claim.itemId)!.settlementSignedAt).toBeNull();
+    const { cookie } = await verifyDevice(t);
+    expect(trackerSteps((await get(t, t.url, cookie)).body)).toEqual([
+      ['Received', 'done'],
+      ['Under review', 'done'],
+      ['Settlement', 'done'],
+      ['Payment', 'done'],
+      ['Closed', 'done'],
+    ]);
+  });
+
   it('shows the settlement offer only once a document for a real amount has been sent', async () => {
     const t = await setup({ statusKey: 'settlement_offered', statusLabel: 'Settlement offered' });
     const { repo } = t.env.ctx;

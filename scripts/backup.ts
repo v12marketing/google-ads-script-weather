@@ -3,7 +3,8 @@
 //
 //   npm run backup                           DATA_DIR/backups/hdc-<UTC stamp>.tar.gz
 //   npm run backup -- --out <dir>            the archive goes into <dir> instead
-//   npm run backup -- --out -                the archive goes to stdout
+//   npm run --silent backup -- --out -       the archive goes to stdout (without
+//                                            --silent, npm prints its own lines there first)
 //   npm run backup -- --check                integrity check, claim count, highest claim number
 //   npm run backup -- --bump-sequence 1234   the next new claim gets at least HDC-001235
 //
@@ -46,7 +47,9 @@ function run(cmd: string, args: string[], toStdout: boolean): Promise<{ code: nu
     let stderr = '';
     child.stderr.on('data', (c: Buffer) => (stderr += c.toString()));
     child.on('error', fail);
-    child.on('close', (code) => done({ code: code ?? 1, stderr }));
+    // Killed by a signal (no exit code): the archive is cut short, so a failure,
+    // never GNU tar's harmless exit 1.
+    child.on('close', (code, signal) => done(code === null ? { code: 128, stderr: `${stderr}tar was stopped (${signal ?? 'signal'})` } : { code, stderr }));
   });
 }
 
@@ -194,6 +197,11 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
   const out = values.out ?? join(dataDir, BACKUPS_DIR);
+  // `npm run backup` without --silent has already printed npm's own lines to
+  // stdout, where they would end up in front of the archive and spoil it.
+  if (out === '-' && process.env.npm_lifecycle_event === 'backup' && process.env.npm_config_loglevel !== 'silent') {
+    throw new Error('npm writes its own lines to stdout ahead of the archive. Use: npm run --silent backup -- --out -');
+  }
   const written = await createBackup(dataDir, out === '-' ? '-' : resolve(out));
   if (written) console.error(`Backup written: ${written}`);
 }

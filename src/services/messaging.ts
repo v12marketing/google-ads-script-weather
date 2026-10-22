@@ -84,6 +84,9 @@ export function routeInbound(
 // Marks a claimant email/text that named no claim while the contact had other
 // open claims, so its Monday post can say so.
 const unroutedKey = (messageId: number): string => `claimant-msg:${messageId}:unrouted`;
+// Marks an email/text that came from contact details the claim had before its
+// email or phone was changed on the board.
+const previousContactKey = (messageId: number): string => `claimant-msg:${messageId}:previous-contact`;
 
 // HTML for the Monday update that carries a claimant's message.
 export function claimantUpdateHtml(m: Pick<ClaimMessage, 'channel' | 'body'>): string {
@@ -108,11 +111,12 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     channel: MessageChannel,
     body: string,
     highlevelMessageId: string | null,
-    unrouted = false,
+    marks: { unrouted?: boolean; previousContact?: boolean } = {},
   ): ClaimMessage | null {
     return db.transaction(() => {
       const m = repo.addMessage({ itemId: claim.itemId, direction: 'from_claimant', channel, body, highlevelMessageId });
-      if (m && unrouted) repo.markEventProcessed(unroutedKey(m.id));
+      if (m && marks.unrouted) repo.markEventProcessed(unroutedKey(m.id));
+      if (m && marks.previousContact) repo.markEventProcessed(previousContactKey(m.id));
       if (m) jobs.enqueue(JOB.portalMessageToMonday, { messageId: m.id }, { dedupeKey: `claimant-msg:${m.id}` });
       return m;
     })();
@@ -127,6 +131,13 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     const numbers = others.map((c) => c.claimNumber).join(', ');
     const what = CHANNEL_LABEL[m.channel];
     return html`\n<p><em>The claimant also has other open claims: ${numbers}. This ${what} did not name a claim, so it was filed on their newest open claim. If it is about another claim, please follow up there.</em></p>`
+      .value;
+  }
+
+  // For an email/text from a claim's previous contact: the team should know.
+  function previousContactNote(m: ClaimMessage): string {
+    if (!repo.isEventProcessed(previousContactKey(m.id))) return '';
+    return html`\n<p><em>This ${CHANNEL_LABEL[m.channel]} came from the email address or phone number this claim had before it was changed on the item. If those old details weren't the claimant's (a mistyped address, say), it may be from someone else.</em></p>`
       .value;
   }
 
@@ -220,7 +231,7 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
       // Posted as the integration user, so the update_created webhook is ignored.
       // The key is the message's own (its time too: ids restart after a restore),
       // so a retry after a lost response doesn't post the message twice.
-      const updateId = await monday.createUpdate(m.itemId, claimantUpdateHtml(m) + otherOpenClaimsNote(claim, m), {
+      const updateId = await monday.createUpdate(m.itemId, claimantUpdateHtml(m) + otherOpenClaimsNote(claim, m) + previousContactNote(m), {
         idempotencyKey: idempotencyKeyFor(`claimant-msg:${m.itemId}:${m.id}:${m.createdAt}`),
       });
       repo.setMessageMondayUpdateId(m.id, updateId);
@@ -265,13 +276,39 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     }
   }
 
-  async function handleInbound(event: InboundEvent): Promise<void> {
-    const claims = repo.findClaimsByContact(event.contactId);
-    const route = routeInbound(claims, event);
+  // A reply from a contact no claim has any more: a claim whose email or phone
+  // was changed on the board moves to another contact, and replies to what was
+  // sent before can still come from the old one. Filed on that claim, with a
+  // note for the team. Keywords (STOP, STATUS, ...) aren't acted on: they would
+  // apply to the claim's new details.
+  async function handleFromPreviousContact(event: InboundEvent): Promise<void> {
+    const route = routeInbound(repo.findClaimsByPreviousContact(event.contactId), event);
     if (!route) {
       log.info({ contactId: event.contactId, channel: event.channel }, 'messaging: inbound message from a contact with no claim');
       return;
     }
+    const { claim } = route;
+    if (event.channel === 'sms') {
+      const kw = keywordOf(event.body);
+      if (kw === 'STATUS' || kw === 'HELP' || OPT_OUT_KEYWORDS.has(kw) || OPT_IN_KEYWORDS.has(kw)) {
+        log.info({ itemId: claim.itemId }, "messaging: SMS keyword from a claim's previous contact, ignoring");
+        return;
+      }
+    }
+    const body = cleanMessageText(event.channel === 'email' ? stripEmailReply(event.body) : event.body);
+    if (!body) return;
+    const m = recordFromClaimant(claim, event.channel, body, event.messageId, { previousContact: true });
+    if (!m) {
+      log.info({ itemId: claim.itemId }, 'messaging: inbound message already recorded');
+      return;
+    }
+    log.info({ itemId: claim.itemId, messageId: m.id, channel: event.channel }, "messaging: claimant replied from the claim's previous contact");
+  }
+
+  async function handleInbound(event: InboundEvent): Promise<void> {
+    const claims = repo.findClaimsByContact(event.contactId);
+    const route = routeInbound(claims, event);
+    if (!route) return handleFromPreviousContact(event);
     const { claim, otherOpen } = route;
 
     if (event.channel === 'sms') {
@@ -288,7 +325,7 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
 
     const body = cleanMessageText(event.channel === 'email' ? stripEmailReply(event.body) : event.body);
     if (!body) return;
-    const m = recordFromClaimant(claim, event.channel, body, event.messageId, otherOpen.length > 0);
+    const m = recordFromClaimant(claim, event.channel, body, event.messageId, { unrouted: otherOpen.length > 0 });
     if (!m) {
       log.info({ itemId: claim.itemId }, 'messaging: inbound message already recorded');
       return;

@@ -266,6 +266,33 @@ describe('HighLevelClient contacts', () => {
     expect(calls.filter((c) => c.method === 'PUT')).toHaveLength(1);
   });
 
+  it('updateContact sets only the details given on that contact; a null phone clears it', async () => {
+    const { hl, calls } = client({ [FIELDS_PATH]: fields, 'PUT /contacts/c1': () => ({ json: {} }) });
+    await hl.updateContact('c1', { phone: null });
+    await hl.updateContact('c1', {
+      name: 'Alice Doe',
+      firstName: 'Alice',
+      email: ' alice@example.com ',
+      phone: '(603) 555-0100',
+      customFields: { claim_number: 'HDC-000001' },
+    });
+    await hl.updateContact('c1', {});
+    const puts = calls.filter((c) => c.method === 'PUT');
+    expect(puts.map((c) => c.body)).toEqual([
+      { phone: null },
+      {
+        name: 'Alice Doe',
+        lastName: 'Doe',
+        firstName: 'Alice',
+        email: 'alice@example.com',
+        phone: '+16035550100',
+        customFields: [{ id: 'cf_claim', field_value: 'HDC-000001' }],
+      },
+    ]);
+    expect(puts[0]!.headers.get('version')).toBe('2021-07-28');
+    await expect(hl.updateContact('c1', { phone: 'not a phone' })).rejects.toThrow(/not a usable phone number/);
+  });
+
   it('adds and removes tags via the tags endpoint', async () => {
     const { hl, calls } = client({ 'POST /contacts/c1/tags': () => ({ json: {} }), 'DELETE /contacts/c1/tags': () => ({ json: {} }) });
     await hl.addTags('c1', ['a', 'b']);

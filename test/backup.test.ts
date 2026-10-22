@@ -102,6 +102,48 @@ describe('scripts/backup.ts', () => {
     }
   });
 
+  it('refuses --out - under `npm run` without --silent, whose own lines would spoil the archive', () => {
+    const { dataDir, db } = liveDataDir();
+    try {
+      const run = (npmEnv: Record<string, string>) =>
+        spawnSync(process.execPath, ['--import', 'tsx', 'scripts/backup.ts', '--out', '-'], {
+          cwd: ROOT,
+          env: { PATH: process.env.PATH, DATA_DIR: dataDir, npm_lifecycle_event: 'backup', ...npmEnv },
+          maxBuffer: 64 * 1024 * 1024,
+        });
+      const loud = run({});
+      expect(loud.status).toBe(1);
+      expect(loud.stdout.length).toBe(0);
+      expect(loud.stderr.toString()).toContain('npm run --silent backup -- --out -');
+
+      const silent = run({ npm_config_loglevel: 'silent' });
+      expect(silent.status, silent.stderr.toString()).toBe(0);
+      const archive = join(tempDir(), 'silent.tar.gz');
+      writeFileSync(archive, silent.stdout);
+      expect(listArchive(archive)).toContain('hdc.sqlite');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('fails, leaving no archive behind, when tar is stopped partway', async () => {
+    const { dataDir, db } = liveDataDir();
+    const bin = tempDir();
+    // A tar killed by a signal partway through its archive (-czf <target> ...),
+    // as by the OOM killer or `kill`.
+    writeFileSync(join(bin, 'tar'), '#!/bin/sh\nprintf partial > "$2"\nkill -KILL $$\n', { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${bin}:${path}`;
+    try {
+      const out = join(tempDir(), 'out');
+      await expect(createBackup(dataDir, out)).rejects.toThrow(/tar failed .*stopped \(SIGKILL\)/);
+      expect(readdirSync(out)).toEqual([]);
+    } finally {
+      process.env.PATH = path;
+      db.close();
+    }
+  });
+
   it('--bump-sequence moves the claim-number sequence forward, never back', () => {
     const { dataDir, db } = liveDataDir();
     db.close();

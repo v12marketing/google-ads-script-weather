@@ -44,8 +44,11 @@ const SMS_ONLY_TEMPLATE_KEYS: ReadonlySet<TemplateKey> = new Set<TemplateKey>(['
 // confirmation's email and text, and the received status is sent under the
 // same event key (status.ts), so its own email and text never go out.
 const PORTAL_ONLY_TEMPLATE_KEYS: ReadonlySet<TemplateKey> = new Set<TemplateKey>(['received']);
-// Password checks (scrypt) running at once, across all clients.
-const MAX_PASSWORD_CHECKS = 2;
+// Password checks (scrypt) running at once, across all clients, and how many
+// more may wait (for up to PASSWORD_CHECK_WAIT_MS) for a turn.
+export const MAX_PASSWORD_CHECKS = 2;
+export const MAX_WAITING_PASSWORD_CHECKS = 8;
+const PASSWORD_CHECK_WAIT_MS = 3000;
 // Placeholders a template must keep, or the message is useless.
 const REQUIRED_VARS: Partial<Record<TemplateKey, Array<keyof TemplateVars>>> = {
   login_code: ['code'],
@@ -190,7 +193,7 @@ export async function registerAdminRoutes(app: FastifyInstance, ctx: AppContext)
   const { config, board, db, repo, jobs, services, monday, highlevel, log } = ctx;
   const csrf = adminCsrfToken(config.APP_SECRET, config.ADMIN_USER);
   const limiter = new FailureLimiter();
-  const passwordChecks = new ConcurrencyLimit(MAX_PASSWORD_CHECKS);
+  const passwordChecks = new ConcurrencyLimit(MAX_PASSWORD_CHECKS, MAX_WAITING_PASSWORD_CHECKS);
   const verified = new VerifiedCredentialCache(config.APP_SECRET);
   const baseUrl = config.PUBLIC_BASE_URL.replace(/\/+$/, '');
   const publicOrigin = new URL(config.PUBLIC_BASE_URL).origin;
@@ -277,7 +280,7 @@ export async function registerAdminRoutes(app: FastifyInstance, ctx: AppContext)
           // Counted before the (slow) check, so guesses sent all at once can't
           // get past the limit before the first ones have failed.
           if (!limiter.begin(key)) return tooManyAttempts(reply, limiter.blockedFor(key) || 1);
-          if (!passwordChecks.tryAcquire()) {
+          if (!(await passwordChecks.acquire(PASSWORD_CHECK_WAIT_MS))) {
             limiter.cancel(key);
             reply.header('Retry-After', '5');
             return send(reply, 429, 'Busy', message('Too many sign-in attempts', 'Too many sign-ins are being checked right now. Please try again in a few seconds.'));

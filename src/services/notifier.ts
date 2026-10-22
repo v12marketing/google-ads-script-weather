@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { ContactIdentity } from '../adapters/highlevel/types.js';
 import type { Claim, TemplateKey, TemplateVars } from '../domain/types.js';
 import { html, type Html } from '../web/html.js';
-import { cleanName, firstNameOf, onceFor } from './claim-fields.js';
+import { cleanName, firstNameOf, formatUtc, onceFor } from './claim-fields.js';
 import type { CoreContext, Notifier, NotifyResult, Services } from './contracts.js';
 import { renderEmailHtml, renderEmailText, type EmailButton } from './email-html.js';
 import { PermanentJobError } from './jobs.js';
@@ -38,6 +38,11 @@ const keyHash = (s: string): string => createHash('sha256').update(s).digest('he
 // (the settlement document goes to the contact).
 const emailFits = (c: Claim, k: ContactIdentity): boolean => (c.email?.trim() ? sameEmail(k.email, c.email) : !k.email?.trim());
 const smsFits = (c: Claim, k: ContactIdentity): boolean => samePhone(k.phone, c.phone);
+// A claim without an email is only ever texted through contactFor (its
+// settlement goes through ensureContact, which keeps the rule above). A text
+// reaches the claim's own phone whatever email the contact has, e.g. one the
+// same person's later claim, filed online with this phone, added to it.
+const textFits = (c: Claim, k: ContactIdentity): boolean => !c.email?.trim() && smsFits(c, k);
 
 // "https://forms.monday.com/forms/abc" from the payment form URL (no query).
 const urlPrefix = (url: string): string => {
@@ -81,8 +86,50 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
 <p>If the claims belong to the same person, give them the same email and phone. Otherwise correct the details on this item.</p>`;
   };
 
+  const contactName = (c: Claim): string => cleanName(c.claimantName) || firstNameOf(c.firstName) || c.claimNumber;
+  const offeredLabel = Object.entries(board.statuses).find(([, k]) => k === 'settlement_offered')?.[0] ?? 'Settlement offered';
+
+  // The claim moved to another contact while its settlement document is out:
+  // the document stays with the contact it went to (and its signature is still
+  // recognised), but the claimant may not be able to reach it. Once per document.
+  async function noteSettlementLeftBehind(itemId: string, contactId: string): Promise<void> {
+    const c = repo.getClaim(itemId);
+    if (!c?.settlementSentAt || c.settlementSignedAt || (c.settlementContactId ?? contactId) === c.highlevelContactId) return;
+    const refs = repo.getSettlementRefs(itemId);
+    await onceFor(ctx, `contact-moved-settlement:${itemId}:${refs.documentId ?? refs.referenceId ?? c.settlementSentAt}`, (once) =>
+      monday.createUpdate(
+        itemId,
+        html`<p>The settlement document sent ${formatUtc(c.settlementSentAt)} went to the claimant's email and phone as they were before this change, and stays there: it can still be signed from there, and the signature will be recognised.</p>
+<p>If the claimant can't get to it, void it in HighLevel (Payments → Documents &amp; Contracts) and set the status to ${offeredLabel} again: a new document then goes to their current details.</p>`.value,
+        once,
+      ),
+    ).catch((err) => log.warn({ itemId, err: errText(err) }, 'notifier: posting the settlement note failed'));
+  }
+
+  // A phone the claim no longer has (changed or cleared on the board) stays on
+  // its HighLevel contact: the upsert never sends a missing phone. Left there, a
+  // later claim with that number would match the contact on it, and HighLevel
+  // would give that contact the new claim's email. So it comes off each contact
+  // the claim used that still has it, unless another claim on that contact has
+  // it too. Best effort: the takeover check in syncContact is the backstop.
+  async function dropFormerPhone(claim: Claim, formerPhone: string, contactIds: Array<string | null>): Promise<void> {
+    if (samePhone(formerPhone, claim.phone)) return;
+    for (const id of new Set(contactIds.filter((v): v is string => !!v))) {
+      try {
+        const k = await highlevel.getContact(id);
+        if (!k || !samePhone(k.phone, formerPhone)) continue;
+        if (repo.findClaimsByContact(id).some((o) => o.itemId !== claim.itemId && samePhone(o.phone, formerPhone))) continue;
+        await highlevel.updateContact(id, { phone: null });
+        log.info({ itemId: claim.itemId, contactId: id }, "notifier: took the claim's former phone off a HighLevel contact");
+      } catch (err) {
+        log.warn({ itemId: claim.itemId, contactId: id, err: errText(err) }, "notifier: taking the claim's former phone off a HighLevel contact failed");
+      }
+    }
+  }
+
   // Creates/updates the claim's contact and returns it, or throws ContactConflictError.
-  async function syncContact(claim: Claim): Promise<ContactIdentity> {
+  // formerPhone: the phone the claim had until the board changed it.
+  async function syncContact(claim: Claim, formerPhone: string | null = null): Promise<ContactIdentity> {
     const email = claim.email?.trim() || null;
     const phone = claim.phone?.trim() || null;
     if (!email && !phone) {
@@ -99,10 +146,33 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
     const keepPhone = !!phone && !phoneShared.length && !emailShared.length;
     // Claims (other than this one) that use the contact with a different email.
     const usedByOthers = (k: ContactIdentity) => others(repo.findClaimsByContact(k.id)).filter(otherEmail);
+    const before = repo.getClaim(claim.itemId)?.highlevelContactId ?? null;
+
+    // The upsert matched, on the phone, a contact that other claims use with
+    // another email (HighLevel had the number on it though no claim here does)
+    // and gave it this claim's email. Put their details back, so their messages
+    // and documents still reach them and the email-only upsert below finds or
+    // creates this claim's own contact. Not when the contact was already this
+    // claimant's: this claim's own, or one with a claim that has this email.
+    async function giveBack(k: ContactIdentity): Promise<void> {
+      if (!sameEmail(k.email, email) || k.id === before) return;
+      const onIt = others(repo.findClaimsByContact(k.id));
+      if (onIt.some((o) => sameEmail(o.email, email))) return;
+      const owners = onIt.filter(otherEmail);
+      if (!owners.length || new Set(owners.map((o) => o.email!.trim().toLowerCase())).size !== 1) return;
+      const owner = owners[0]!;
+      await highlevel.updateContact(k.id, {
+        name: contactName(owner),
+        firstName: firstNameOf(owner.firstName),
+        email: owner.email!.trim(),
+        customFields: { claim_number: owner.claimNumber, portal_url: services.tokens.portalUrl(owner) },
+      });
+      log.warn({ itemId: claim.itemId, contactId: k.id }, "notifier: put another claim's email back on the HighLevel contact its phone matched");
+    }
 
     const upsert = (withPhone: boolean) =>
       highlevel.upsertContact({
-        name: cleanName(claim.claimantName) || firstNameOf(claim.firstName) || claim.claimNumber,
+        name: contactName(claim),
         firstName: firstNameOf(claim.firstName),
         email,
         phone: withPhone ? phone : null,
@@ -118,6 +188,7 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
         // HighLevel matched a contact on the phone that isn't this email's (or is
         // another claim's): match on the email alone, leaving the phone off.
         log.warn({ itemId: claim.itemId }, 'notifier: phone matched another HighLevel contact; matching on email only');
+        await giveBack(k);
         k = await upsert(false);
       }
     }
@@ -127,6 +198,7 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
         monday.createUpdate(claim.itemId, conflictNote(claim, involved).value, once),
       );
       log.warn({ itemId: claim.itemId }, 'notifier: no HighLevel contact reaches only this claim; nothing sent');
+      if (formerPhone) await dropFormerPhone(claim, formerPhone, [before]);
       throw new ContactConflictError(
         `Claim ${claim.claimNumber}: no HighLevel contact matches only this claim's ${email ? 'email' : 'phone'}; not sending (the team was told on the item)`,
       );
@@ -142,19 +214,22 @@ export function createNotifier(ctx: CoreContext, services: Services): Notifier {
         monday.createUpdate(claim.itemId, smsOffNote(phoneShared, emailShared).value, once),
       ).catch((err) => log.warn({ itemId: claim.itemId, err: errText(err) }, 'notifier: posting the texts-off note failed'));
     }
-    if (repo.getClaim(claim.itemId)?.highlevelContactId !== k.id) repo.updateClaim(claim.itemId, { highlevelContactId: k.id });
+    repo.setHighlevelContact(claim.itemId, k.id);
+    if (before && before !== k.id) await noteSettlementLeftBehind(claim.itemId, before);
+    if (formerPhone) await dropFormerPhone(claim, formerPhone, [k.id, before]);
     return k;
   }
 
-  const ensureContact = async (claim: Claim): Promise<string> => (await syncContact(current(claim))).id;
+  const ensureContact = async (claim: Claim, opts: { formerPhone?: string | null } = {}): Promise<string> =>
+    (await syncContact(current(claim), opts.formerPhone ?? null)).id;
 
   // The claim's contact, re-read from HighLevel right before a send: the stored
   // id is used only while the contact still has the claim's email (and, to text,
-  // its phone). Otherwise the contact is synced again, which refuses rather
-  // than send to someone else.
+  // its phone; a claim without an email, only its phone). Otherwise the contact
+  // is synced again, which refuses rather than send to someone else.
   async function contactFor(c: Claim, texting: boolean): Promise<ContactIdentity> {
     const k = c.highlevelContactId ? await highlevel.getContact(c.highlevelContactId) : null;
-    if (k && emailFits(c, k) && (!texting || smsFits(c, k))) return k;
+    if (k && (emailFits(c, k) || (texting && textFits(c, k))) && (!texting || smsFits(c, k))) return k;
     return syncContact(c);
   }
 

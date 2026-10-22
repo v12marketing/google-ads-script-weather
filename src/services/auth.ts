@@ -9,7 +9,7 @@ import { ContactConflictError } from './notifier.js';
 // Portal device trust. A browser proves it can read the claim's email with a
 // one-time code; from then on its device cookie is trusted for that claim until
 // the claim's tokenVersion changes or the claim's email does (intake.refreshClaim
-// then forgets its devices). Device ids and codes are stored only as
+// then forgets its devices and retires its unused codes). Device ids and codes are stored only as
 // hashes, and neither is ever logged.
 
 // 32 random bytes, base64url: what the signed hdc_device cookie carries.

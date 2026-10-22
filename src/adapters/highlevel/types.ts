@@ -23,6 +23,14 @@ export interface ContactIdentity {
   phone: string | null;
 }
 
+export interface ContactDetails {
+  name?: string;
+  firstName?: string;
+  email?: string;
+  phone?: string | null;
+  customFields?: Record<string, string>;
+}
+
 export interface SendEmailInput {
   contactId: string;
   subject: string;
@@ -51,6 +59,9 @@ export interface HighLevelApi {
   upsertContact(input: ContactInput): Promise<ContactIdentity>;
   // The contact's current email and phone (GET /contacts/{id}); null if it no longer exists.
   getContact(contactId: string): Promise<ContactIdentity | null>;
+  // Sets details on that one contact (PUT /contacts/{id}), with no duplicate
+  // matching. Fields left undefined keep their value; phone null clears the number.
+  updateContact(contactId: string, details: ContactDetails): Promise<void>;
   updateContactFields(contactId: string, customFields: Record<string, string>): Promise<void>;
   addTags(contactId: string, tags: string[]): Promise<void>;
   removeTags(contactId: string, tags: string[]): Promise<void>;

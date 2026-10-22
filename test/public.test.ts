@@ -189,6 +189,22 @@ describe('find my claim', () => {
     expect(res.headers['retry-after']).toBeDefined();
     expect(env.ctx.services.auth.sendClaimLinks).toHaveBeenCalledTimes(5);
   });
+
+  it('counts an IPv6 client per /64, so changing address within it gets no fresh allowance', async () => {
+    await setup();
+    env.ctx.services.auth.sendClaimLinks = vi.fn(async () => {});
+    const from = (ip: string, i: number) =>
+      app.inject({
+        method: 'POST',
+        url: '/find-my-claim',
+        payload: new URLSearchParams({ email: `user${i}@example.com` }).toString(),
+        headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': ip },
+      });
+    for (let i = 0; i < 5; i++) expect((await from(`2001:db8:1:2::${i + 1}`, i)).statusCode).toBe(303);
+    expect((await from('2001:db8:1:2:ffff::9', 6)).statusCode).toBe(429);
+    // Another /64 has its own allowance.
+    expect((await from('2001:db8:1:3::1', 7)).statusCode).toBe(303);
+  });
 });
 
 describe('errors', () => {

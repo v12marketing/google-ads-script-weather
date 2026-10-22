@@ -166,6 +166,46 @@ describe('portal.js uploads', () => {
     expect(t.location.assign).toHaveBeenCalledWith('/c/tok?uploaded=2#files');
   });
 
+  it('reloads the claim page when the address to show differs only in its #fragment', async () => {
+    // e.g. after an earlier upload of as many files, then the skip link (#main).
+    const t = setup();
+    Object.assign(t.location, { search: '?uploaded=2', hash: '#main' });
+    t.choose([file('a.png', 10), file('b.png', 10)]);
+    expect(t.submit()).toBe(false);
+    await vi.waitFor(() => expect(t.location.reload).toHaveBeenCalled());
+    expect(t.location.assign).not.toHaveBeenCalled();
+    expect(t.location.hash).toBe('files');
+  });
+
+  it("'Show them' after a partly failed upload loads the claim page, even when only the #fragment differs", async () => {
+    const t = setup();
+    t.setResponse((n) => (n === 1 ? { added: 1, errors: [] } : { added: 0, errors: [{ name: 'b.png', message: 'Nope.' }] }));
+    t.choose([file('a.png', 10), file('b.png', 10)]);
+    t.submit();
+    await vi.waitFor(() => expect(t.button.disabled).toBe(false));
+    const link = t.form.all().find((el) => el.id === 'upload-added')!.all().find((el) => el.tagName === 'a')!;
+    expect(link.href).toBe('/c/tok?uploaded=1#files');
+    const click = () => {
+      const e: FakeEvent = {
+        target: link,
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+      };
+      for (const fn of link.listeners.click ?? []) fn(e);
+      return e;
+    };
+
+    expect(click().defaultPrevented).toBe(true);
+    expect(t.location.assign).toHaveBeenCalledWith('/c/tok?uploaded=1#files');
+
+    Object.assign(t.location, { search: '?uploaded=1', hash: '' });
+    click();
+    expect(t.location.reload).toHaveBeenCalledTimes(1);
+    expect(t.location.hash).toBe('files');
+  });
+
   it('warns and sends nothing when more files are chosen than one upload takes', () => {
     const t = setup();
     t.choose(Array.from({ length: 11 }, (_, i) => file(`p${i}.png`, 10)));

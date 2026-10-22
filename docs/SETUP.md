@@ -70,7 +70,10 @@ step 7 puts them all in place:
 1. In the Hetzner Cloud console, **Create server**:
    - Location: a US region (Ashburn or Hillsboro).
    - Image: **Ubuntu 24.04**.
-   - Type: CX22 or CPX21 (2 vCPU, 4 GB) is plenty.
+   - Type: CX22 or CPX21 (2 vCPU, 4 GB) is plenty to start. The disk is what
+     runs out first: claim photos are kept for good, and the nightly backup
+     needs room for one more copy of them (section 12, "Backups"). Plan on
+     roughly the claims per month times their photos' size, a few times over.
    - Add your SSH key. Turn on **Backups** (daily server snapshots; cheap insurance
      on top of the data backups in section 12).
    - Name it `hdc-prod`.
@@ -722,9 +725,10 @@ text, and texting STATUS should get a reply.
   - [ ] Set Payment sent, then Closed: emails arrive.
   - [ ] (Once SMS is on) Text STATUS, then STOP: status reply, then email only.
   - [ ] **/admin** shows no failed jobs.
-- [ ] **Backups** scheduled (section 12) and one restore tried on a scratch
-      server with the worker off and dummy tokens (section 12, "Trying a
-      restore").
+- [ ] **Backups** scheduled (section 12), copied to the Storage Box, with the
+      heartbeat monitor set up (it alerts on a failed backup or a disk over
+      80% full), and one restore tried on a scratch server with the worker off
+      and dummy tokens (section 12, "Trying a restore").
 - [ ] An **uptime monitor** (e.g. UptimeRobot, Better Stack) checks
       `https://homedeliveryclaims.com/healthz` every few minutes and alerts you.
 - [ ] Admin password, `.env` and the webhook URL are in the password manager and
@@ -776,17 +780,54 @@ one `.tar.gz`. It runs inside the container as the app's own user and writes
 the archive to its output, which the host saves; so no folder needs special
 ownership, and the archive gets the host's permissions.
 
-Create `/opt/hdc-backup.sh`:
+Every archive is a **full** copy, about as big as the data itself (claim photos
+and videos hardly compress), and the cached files are kept for good, so the
+data grows with every claim. The server therefore keeps only the last two
+archives; the history lives **off the server**, in a Hetzner Storage Box (any
+size will do to start; it is separate storage, so it can't fill this disk).
+
+1. Order a Storage Box in the Hetzner console, turn on **SSH support**, and note
+   its user name (`u123456`). Under its **Snapshots**, add a daily automatic
+   snapshot and keep 30: that is the 30 days of history.
+2. Give the server's root user a key for it:
+   ```sh
+   sudo apt -y install rsync curl
+   sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519     # skip if root already has a key
+   sudo sh -c 'cat /root/.ssh/id_ed25519.pub | ssh -p 23 u123456@u123456.your-storagebox.de install-ssh-key'
+   sudo ssh -p 23 u123456@u123456.your-storagebox.de mkdir hdc-backups
+   ```
+3. Create a **heartbeat** monitor (Better Stack and UptimeRobot both have
+   them, as do services like healthchecks.io) expecting a ping every day with
+   a few hours' grace, alerting the same people as the uptime monitor from the
+   launch checklist. Note its ping URL.
+
+Create `/opt/hdc-backup.sh`, with your Storage Box user and the ping URL:
 
 ```sh
 #!/bin/sh
-# Nightly backup of the service's data to /opt/hdc-backups, keeping 30 days.
+# Nightly backup of the service's data: written to /opt/hdc-backups (the last
+# KEEP kept here), copied to the Storage Box, then the heartbeat is pinged. The
+# heartbeat alerts when a night goes by without it.
 set -eu
 umask 077    # archives hold personal data: readable by root only
+KEEP=2
+OFFSITE='u123456@u123456.your-storagebox.de:hdc-backups/'
+HEARTBEAT='https://<the heartbeat ping URL>'
+DIR=/opt/hdc-backups
 STAMP=$(date -u +%Y%m%d-%H%M%S)
-OUT=/opt/hdc-backups/hdc-$STAMP.tar.gz
-mkdir -p /opt/hdc-backups
+OUT=$DIR/hdc-$STAMP.tar.gz
+mkdir -p "$DIR"
 cd /opt/hdc/deploy
+# Make room for tonight's archive first: at most KEEP on the disk at any time.
+ls -1t "$DIR"/hdc-*.tar.gz 2>/dev/null | tail -n +$KEEP | xargs -r rm -f
+# Room for one more archive (about the size of the data) and 3 GB to spare for
+# the app; otherwise stop here rather than fill the disk the service runs on.
+NEED_KB=$(docker compose exec -T app du -sk /data | cut -f1)
+FREE_KB=$(df -Pk "$DIR" | awk 'NR == 2 { print $4 }')
+if [ "$FREE_KB" -lt $((NEED_KB + 3145728)) ]; then
+  echo "$(date): backup NOT written: only $((FREE_KB / 1024)) MB free, the data is $((NEED_KB / 1024)) MB" >&2
+  exit 1
+fi
 if ! docker compose exec -T app node dist/scripts/backup.js --out - > "$OUT.part" \
    || ! tar -tzf "$OUT.part" > /dev/null; then
   rm -f "$OUT.part"
@@ -794,8 +835,15 @@ if ! docker compose exec -T app node dist/scripts/backup.js --out - > "$OUT.part
   exit 1
 fi
 mv "$OUT.part" "$OUT"
-find /opt/hdc-backups -name 'hdc-*.tar.gz' -mtime +30 -delete
-echo "$(date): backup written to $OUT"
+rsync -a --delete -e 'ssh -p 23' "$DIR"/ "$OFFSITE"
+# The disk itself: no heartbeat (so an alert) once it is 80% full.
+USED=$(df -P / | awk 'NR == 2 { sub("%", "", $5); print $5 }')
+if [ "$USED" -ge 80 ]; then
+  echo "$(date): backup written to $OUT, but the disk is ${USED}% full" >&2
+  exit 1
+fi
+curl -fsS -m 30 --retry 3 "$HEARTBEAT" > /dev/null
+echo "$(date): backup written to $OUT and copied to the Storage Box"
 ```
 
 ```sh
@@ -804,10 +852,18 @@ sudo /opt/hdc-backup.sh && sudo ls -lh /opt/hdc-backups     # try it once
 sudo crontab -e      # add the line:  30 3 * * * /opt/hdc-backup.sh >> /var/log/hdc-backup.log 2>&1
 ```
 
-Check `/var/log/hdc-backup.log` now and then: it ends with "backup written" when
-all is well. The archives contain personal data: keep a copy **off the server**
-(e.g. a Hetzner Storage Box with `rsync`, or encrypted with `restic`/`rclone`),
-and limit who can read them.
+The Storage Box holds the same last two archives (`--delete`) and its daily
+snapshots keep each night's set for 30 days: to restore an older archive,
+copy it out of the snapshot folder (`.zfs/snapshot/` on the Storage Box) first.
+If the heartbeat alerts, read the end of `/var/log/hdc-backup.log`: it says
+whether the backup failed, the disk is filling up (see "Disk space" below) or
+the copy to the Storage Box failed. The archives contain personal data: limit
+who can read them, here and on the Storage Box.
+
+**Disk space.** The data (`docker compose exec app du -sh /data`) grows with
+every claim's photos, and the disk needs room for it plus the two archives.
+When the disk passes 80% (`df -h /`), resize the server to a type with a bigger
+disk (Hetzner console, **Rescale**, with "CPU and RAM only" unticked).
 
 Run without `--out -`, the script writes the archive into the data volume
 instead (`/data/backups`, which the app's user can write; later backups leave it

@@ -1,5 +1,6 @@
 import type { AppConfig } from '../../config.js';
 import type {
+  ContactDetails,
   ContactIdentity,
   ContactInput,
   HighLevelApi,
@@ -193,6 +194,31 @@ export class HighLevelClient implements HighLevelApi {
       if (err instanceof HighLevelApiError && (err.status === 404 || (err.status === 400 && /not\s*found/i.test(err.detail)))) return null;
       throw err;
     }
+  }
+
+  // This contact only: unlike the upsert, PUT does no duplicate matching. Its
+  // UpdateContactDto declares email and phone nullable, so phone null clears the
+  // number. Never sends tags (they would replace all of the contact's tags).
+  async updateContact(contactId: string, details: ContactDetails): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (details.name !== undefined) {
+      body.name = details.name;
+      const lastName = lastNameOf(details.name, details.firstName ?? '');
+      if (lastName) body.lastName = lastName;
+    }
+    if (details.firstName !== undefined) body.firstName = details.firstName;
+    if (details.email !== undefined) body.email = details.email.trim();
+    if (details.phone === null) body.phone = null;
+    else if (details.phone !== undefined) {
+      const phone = toE164(details.phone);
+      if (!phone) throw new Error('HighLevel updateContact: not a usable phone number');
+      body.phone = phone;
+    }
+    if (details.customFields && Object.keys(details.customFields).length > 0) {
+      body.customFields = await this.customFieldValues(details.customFields);
+    }
+    if (Object.keys(body).length === 0) return;
+    await this.request('PUT', `/contacts/${seg(contactId)}`, { body });
   }
 
   async updateContactFields(contactId: string, customFields: Record<string, string>): Promise<void> {

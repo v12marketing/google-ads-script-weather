@@ -39,7 +39,7 @@ the code follows (what is never logged, what never goes in a text message).
 | `npm run monday:setup -- webhooks` | Register the Monday webhooks (safe to re-run; `--delete` removes them). |
 | `npm run highlevel:setup -- check` | Check the HighLevel token, custom fields, settlement template and user. |
 | `npm run highlevel:setup -- fields` | Create the HighLevel contact custom fields the service uses. |
-| `npm run backup` | Back up `DATA_DIR`: a consistent copy of the database plus the cached files, as one `.tar.gz` in `DATA_DIR/backups` (`-- --out -` writes it to stdout). |
+| `npm run backup` | Back up `DATA_DIR`: a consistent copy of the database plus the cached files, as one `.tar.gz` in `DATA_DIR/backups` (`npm run --silent backup -- --out -` writes it to stdout; without `--silent`, npm's own lines would land in the archive). |
 | `npm run backup -- --check` | Integrity check of the database in `DATA_DIR`, with its claim count and highest claim number. |
 | `npm run backup -- --bump-sequence 1234` | After a restore: the next new claim is numbered above 1234 (never moves the sequence back). |
 

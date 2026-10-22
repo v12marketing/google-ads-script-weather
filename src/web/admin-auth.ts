@@ -136,13 +136,18 @@ export function clientKey(ip: string): string {
     .join(':')}::/64`;
 }
 
-// At most `max` slow operations (password hashing) at once. Callers that find
-// it full are turned away rather than queued: scrypt runs on libuv's small
-// thread pool, which file reads and DNS lookups for every request share.
+// At most `max` slow operations (password hashing) at once: scrypt runs on
+// libuv's small thread pool, which file reads and DNS lookups for every request
+// share. A caller that finds it full may wait a little for its turn, behind at
+// most `maxWaiting` others; the rest are turned away.
 export class ConcurrencyLimit {
   private active = 0;
+  private waiting: Array<{ grant: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }> = [];
 
-  constructor(readonly max: number) {}
+  constructor(
+    readonly max: number,
+    readonly maxWaiting = 0,
+  ) {}
 
   tryAcquire(): boolean {
     if (this.active >= this.max) return false;
@@ -150,13 +155,40 @@ export class ConcurrencyLimit {
     return true;
   }
 
+  // True once a slot is held; false when none came free within waitMs, or
+  // straight away when maxWaiting callers are waiting already.
+  acquire(waitMs: number): Promise<boolean> {
+    if (this.tryAcquire()) return Promise.resolve(true);
+    if (this.waiting.length >= this.maxWaiting) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const w = {
+        grant: resolve,
+        timer: setTimeout(() => {
+          this.waiting.splice(this.waiting.indexOf(w), 1);
+          resolve(false);
+        }, waitMs),
+      };
+      w.timer.unref?.();
+      this.waiting.push(w);
+    });
+  }
+
   release(): void {
+    const next = this.waiting.shift();
+    if (next) {
+      // The slot passes straight to the longest-waiting caller.
+      clearTimeout(next.timer);
+      next.grant(true);
+      return;
+    }
     if (this.active > 0) this.active--;
   }
 }
 
 // Remembers recently verified Authorization headers (by HMAC, never the header
-// itself) so every admin request doesn't pay for a scrypt run.
+// itself) so every admin request doesn't pay for a scrypt run. Each use renews
+// the entry: someone working in /admin isn't sent back to the password check
+// (and its queue) every few minutes.
 export class VerifiedCredentialCache {
   private entries = new Map<string, number>();
 
@@ -177,6 +209,7 @@ export class VerifiedCredentialCache {
       this.entries.delete(k);
       return false;
     }
+    this.entries.set(k, now + this.ttlMs);
     return true;
   }
 

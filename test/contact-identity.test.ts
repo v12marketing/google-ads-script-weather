@@ -131,6 +131,26 @@ describe('HighLevel contact identity', () => {
     expect(sent.emails.at(-1)!.to).toBe('jane@gmail.com');
   });
 
+  it('a login code emailed to the old address stops working when the email is corrected', async () => {
+    const env = makeTestEnv();
+    const sent = deliveries(env);
+    const jane = await fileClaim(env, { email: 'jane@gmial.com' });
+    const { auth, intake } = env.ctx.services;
+    const device = auth.newDeviceId();
+    await auth.sendLoginCode(jane.claim(), device);
+    expect(sent.emails.at(-1)!.to).toBe('jane@gmial.com');
+    const code = codeIn(sent.emails.at(-1)!.text);
+
+    env.monday.setText(jane.item.id, env.board.columns.email, 'jane@gmail.com', 'email');
+    const claim = (await intake.refreshClaim(jane.item.id))!;
+    expect(auth.verifyLoginCode(claim, device, code)).toBe('expired');
+    expect(auth.isDeviceTrusted(claim, device)).toBe(false);
+    // A new code goes to the corrected address and works.
+    await auth.sendLoginCode(claim, device);
+    expect(sent.emails.at(-1)!.to).toBe('jane@gmail.com');
+    expect(auth.verifyLoginCode(claim, device, codeIn(sent.emails.at(-1)!.text))).toBe('ok');
+  });
+
   it('a corrected phone reaches HighLevel without forgetting trusted browsers', async () => {
     const env = makeTestEnv();
     const sent = deliveries(env);
@@ -193,6 +213,103 @@ describe('HighLevel contact identity', () => {
     expect(env.highlevel.contacts.get(vera.claim().highlevelContactId!)).toMatchObject({ name: 'Vera Victim', email: VERA.email });
     expect(sent.sms.filter((s) => s.message.includes(claim.claimNumber))).toEqual([]);
     expect(updatesOn(env, walkIn.id).filter((u) => u.startsWith('Texts to the claimant are on hold'))).toHaveLength(1);
+  });
+});
+
+describe('a phone the claim no longer has', () => {
+  it("comes off the claim's HighLevel contact, so a later claim with that number can't take the contact over", async () => {
+    const env = makeTestEnv();
+    const sent = deliveries(env);
+    const alice = await fileClaim(env, { name: 'Alice Doe', email: 'alice@example.com', phone: '+16035550100' });
+    const k = alice.claim().highlevelContactId!;
+    env.monday.setText(alice.item.id, env.board.columns.phone, '', 'phone');
+    await env.ctx.services.intake.refreshClaim(alice.item.id);
+    expect(env.highlevel.contacts.get(k)).toMatchObject({ email: 'alice@example.com', phone: null });
+
+    const bob = await fileClaim(env, { name: 'Bob Doe', email: 'bob@example.com', phone: '+16035550100' });
+    expect(env.highlevel.contacts.get(k)!.email).toBe('alice@example.com');
+    expect(bob.claim().highlevelContactId).not.toBe(k);
+    expect(env.highlevel.contacts.get(bob.claim().highlevelContactId!)).toMatchObject({ email: 'bob@example.com', phone: '+16035550100' });
+    await env.ctx.services.notifier.notify(alice.claim(), 'under_review');
+    expect(sent.emails.at(-1)!.to).toBe('alice@example.com');
+    expect(alice.claim().highlevelContactId).toBe(k);
+  });
+
+  it('comes off when it is replaced by one that HighLevel has on another contact', async () => {
+    const env = makeTestEnv();
+    const alice = await fileClaim(env, { name: 'Alice Doe', email: 'alice@example.com', phone: '+16035550100' });
+    const k = alice.claim().highlevelContactId!;
+    const other = await env.highlevel.upsertContact({ name: 'Pat', firstName: 'Pat', email: 'pat@example.com', phone: '+16035550177', smsOptIn: false });
+    env.monday.setText(alice.item.id, env.board.columns.phone, '+16035550177', 'phone');
+    await env.ctx.services.intake.refreshClaim(alice.item.id);
+    expect(env.highlevel.contacts.get(k)).toMatchObject({ email: 'alice@example.com', phone: null });
+    expect(env.highlevel.contacts.get(other.id)).toMatchObject({ email: 'pat@example.com', phone: '+16035550177' });
+  });
+
+  it("stays on the contact while another of the claimant's claims there has it", async () => {
+    const env = makeTestEnv();
+    const first = await fileClaim(env, { email: 'jane@example.com', phone: '+16035550100' });
+    const second = await fileClaim(env, { email: 'jane@example.com', phone: '+16035550100' });
+    const k = first.claim().highlevelContactId!;
+    expect(second.claim().highlevelContactId).toBe(k);
+    env.monday.setText(second.item.id, env.board.columns.phone, '', 'phone');
+    await env.ctx.services.intake.refreshClaim(second.item.id);
+    expect(env.highlevel.contacts.get(k)!.phone).toBe('+16035550100');
+  });
+
+  it("if HighLevel still has it on another claim's contact, that contact gets its own email back and the new claim one of its own", async () => {
+    const env = makeTestEnv();
+    const alice = await fileClaim(env, { name: 'Alice Doe', email: 'alice@example.com', phone: '' });
+    const k = alice.claim().highlevelContactId!;
+    // The number got onto Alice's contact some other way (typed in HighLevel, say).
+    env.highlevel.contacts.get(k)!.phone = '+16035550100';
+
+    const bob = await fileClaim(env, { name: 'Bob Doe', email: 'bob@example.com', phone: '+16035550100' });
+    expect(env.highlevel.contacts.get(k)).toMatchObject({ email: 'alice@example.com', name: 'Alice Doe', customFields: { claim_number: alice.claim().claimNumber } });
+    expect(bob.claim().highlevelContactId).not.toBe(k);
+    expect(env.highlevel.contacts.get(bob.claim().highlevelContactId!)!.email).toBe('bob@example.com');
+    expect(updatesOn(env, bob.item.id).filter((u) => u.startsWith('Texts are off'))).toHaveLength(1);
+  });
+});
+
+describe('a claim with only a phone', () => {
+  it("is still texted once the same person's later claim, filed online with that phone, adds an email to the contact", async () => {
+    const env = makeTestEnv();
+    const sent = deliveries(env);
+    const c = env.board.columns;
+    const walkIn = env.monday.addItem(env.board.claimsBoardId, 'Jane Doe', {
+      [c.phone]: { type: 'phone', text: '+16035550100' },
+      [c.smsOptIn]: { type: 'checkbox', text: 'v', value: '{"checked":"true"}' },
+      [c.status]: { type: 'status', text: 'New' },
+    });
+    await env.ctx.services.intake.handleItemCreated(walkIn.id);
+    expect(sent.sms).toHaveLength(1);
+    await fileClaim(env, { email: 'jane@example.com', phone: '+16035550100' });
+
+    const claim = env.ctx.repo.getClaim(walkIn.id)!;
+    expect(env.highlevel.contacts.get(claim.highlevelContactId!)!.email).toBe('jane@example.com');
+    const res = await env.ctx.services.notifier.notify(claim, 'under_review');
+    expect(res).toEqual({ emailSent: false, smsSent: true });
+    expect(sent.sms.at(-1)).toMatchObject({ to: '+16035550100' });
+    expect(sent.sms.at(-1)!.message).toContain(claim.claimNumber);
+    expect(updatesOn(env, walkIn.id).filter((u) => u.startsWith('Texts to the claimant are on hold'))).toEqual([]);
+  });
+
+  it("gets no settlement through a contact with someone's email, and the team hears why this time", async () => {
+    const env = makeTestEnv();
+    const c = env.board.columns;
+    const walkIn = env.monday.addItem(env.board.claimsBoardId, 'Jane Doe', {
+      [c.phone]: { type: 'phone', text: '+16035550100' },
+      [c.smsOptIn]: { type: 'checkbox', text: 'v', value: '{"checked":"true"}' },
+      [c.status]: { type: 'status', text: 'New' },
+      [c.settlementAmount]: { type: 'numbers', text: '500' },
+    });
+    await env.ctx.services.intake.handleItemCreated(walkIn.id);
+    await fileClaim(env, { email: 'jane@example.com', phone: '+16035550100' });
+
+    await expect(env.ctx.services.settlement.sendSettlement(env.ctx.repo.getClaim(walkIn.id)!)).rejects.toBeInstanceOf(ContactConflictError);
+    expect(env.highlevel.settlementRequests).toEqual([]);
+    expect(updatesOn(env, walkIn.id).at(-1)).toMatch(/^Settlement offered, but no document was sent: HighLevel has no contact that reaches only this claimant/);
   });
 });
 

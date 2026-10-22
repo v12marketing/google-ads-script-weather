@@ -41,6 +41,11 @@ export interface Claim {
   // ids are known or the attempt is given up.
   settlementAttemptAt: string | null;
   settlementAttemptAmount: number | null;
+  // The HighLevel contact the tracked document was sent to, and the one the send
+  // of unknown outcome went to. highlevelContactId can move on while a document
+  // is out (an email or phone edit re-syncs the contact); these don't.
+  settlementContactId: string | null;
+  settlementAttemptContactId: string | null;
   // Last time the open document was found in HighLevel.
   settlementSeenAt: string | null;
   // The claimant's signing link for the open document, when HighLevel gives one.

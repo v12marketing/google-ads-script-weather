@@ -38,6 +38,8 @@ interface ClaimRow {
   settlement_signed_at: string | null;
   settlement_attempt_at: string | null;
   settlement_attempt_amount: number | null;
+  settlement_contact_id: string | null;
+  settlement_attempt_contact_id: string | null;
   settlement_seen_at: string | null;
   settlement_checked_at: string | null;
   settlement_sign_url: string | null;
@@ -66,6 +68,8 @@ const toClaim = (r: ClaimRow): Claim => ({
   settlementSignedAt: r.settlement_signed_at,
   settlementAttemptAt: r.settlement_attempt_at,
   settlementAttemptAmount: r.settlement_attempt_amount,
+  settlementContactId: r.settlement_contact_id,
+  settlementAttemptContactId: r.settlement_attempt_contact_id,
   settlementSeenAt: r.settlement_seen_at,
   settlementSignUrl: r.settlement_sign_url,
   paymentDetailsReceivedAt: r.payment_details_received_at,
@@ -110,6 +114,8 @@ export type ClaimPatch = Partial<{
   settlementSignedAt: string | null;
   settlementAttemptAt: string | null;
   settlementAttemptAmount: number | null;
+  settlementContactId: string | null;
+  settlementAttemptContactId: string | null;
   settlementSeenAt: string | null;
   settlementSignUrl: string | null;
   paymentDetailsReceivedAt: string | null;
@@ -136,6 +142,8 @@ const PATCH_COLUMNS: Record<keyof ClaimPatch, string> = {
   settlementSignedAt: 'settlement_signed_at',
   settlementAttemptAt: 'settlement_attempt_at',
   settlementAttemptAmount: 'settlement_attempt_amount',
+  settlementContactId: 'settlement_contact_id',
+  settlementAttemptContactId: 'settlement_attempt_contact_id',
   settlementSeenAt: 'settlement_seen_at',
   settlementSignUrl: 'settlement_sign_url',
   paymentDetailsReceivedAt: 'payment_details_received_at',
@@ -208,6 +216,45 @@ export class Repo {
     const rows = this.db
       .prepare('SELECT * FROM claims WHERE highlevel_contact_id = ? ORDER BY received_at DESC')
       .all(contactId) as ClaimRow[];
+    return rows.map(toClaim);
+  }
+
+  // Claims whose own contact this is, or whose settlement document (or send of
+  // unknown outcome) went to it. Most recently received first.
+  findClaimsUsingContact(contactId: string): Claim[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM claims
+         WHERE highlevel_contact_id = ? OR settlement_contact_id = ? OR settlement_attempt_contact_id = ?
+         ORDER BY received_at DESC`,
+      )
+      .all(contactId, contactId, contactId) as ClaimRow[];
+    return rows.map(toClaim);
+  }
+
+  // Points the claim at a HighLevel contact, remembering the one it replaces.
+  setHighlevelContact(itemId: string, contactId: string): void {
+    this.db.transaction(() => {
+      const before = this.getClaim(itemId)?.highlevelContactId ?? null;
+      if (before === contactId) return;
+      if (before) {
+        this.db
+          .prepare('INSERT OR IGNORE INTO claim_previous_contacts (item_id, contact_id, created_at) VALUES (?, ?, ?)')
+          .run(itemId, before, nowIso());
+      }
+      this.updateClaim(itemId, { highlevelContactId: contactId });
+    })();
+  }
+
+  // Claims that used this contact before and have another one now, most recently received first.
+  findClaimsByPreviousContact(contactId: string): Claim[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.* FROM claims c JOIN claim_previous_contacts p ON p.item_id = c.item_id
+         WHERE p.contact_id = ? AND c.highlevel_contact_id IS NOT ?
+         ORDER BY c.received_at DESC`,
+      )
+      .all(contactId, contactId) as ClaimRow[];
     return rows.map(toClaim);
   }
 
@@ -427,6 +474,12 @@ export class Repo {
   // email address the claim no longer has). The link itself keeps working.
   deleteDevices(itemId: string): number {
     return this.db.prepare('DELETE FROM devices WHERE item_id = ?').run(itemId).changes;
+  }
+
+  // Login codes not used yet stop working (they were emailed to an address the
+  // claim no longer has). Kept, marked used, so they still count toward the limits.
+  retireLoginCodes(itemId: string): number {
+    return this.db.prepare('UPDATE login_codes SET used_at = ? WHERE item_id = ? AND used_at IS NULL').run(nowIso(), itemId).changes;
   }
 
   // How many files the claimant has on the claim (portal uploads and claimant

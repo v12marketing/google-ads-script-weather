@@ -288,7 +288,10 @@ ${steps.map(
     }
     if (claim.statusKey === 'closed') {
       const history = statusHistory(messages);
-      if (!claim.settlementSignedAt) {
+      // The team can record a signature on the board (the claim then never has
+      // settlementSignedAt), so the timeline counts too.
+      const settled = !!claim.settlementSignedAt || history.some((k) => k === 'settlement_signed' || k === 'payment_sent');
+      if (!settled) {
         // Closed without a settlement (denied, withdrawn, duplicate): no settlement or payment to show.
         const denied = history.filter((k) => k !== 'closed').at(-1) === 'denied';
         return trackerList(

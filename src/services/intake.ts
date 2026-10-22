@@ -64,24 +64,25 @@ export function createIntakeService(ctx: CoreContext, services: Services): Intak
     );
 
   // Caches the board's fields. A changed email forgets the browsers trusted for
-  // the claim: they proved they could read the old address, not the new one.
-  function applyFields(before: Claim, f: ClaimFields): { claim: Claim; contactChanged: boolean } {
+  // the claim, and retires the login codes not used yet: they proved (or would
+  // prove) they could read the old address, not the new one.
+  function applyFields(before: Claim, f: ClaimFields): { claim: Claim; contactChanged: boolean; formerPhone: string | null } {
     const emailChanged = (before.email?.trim().toLowerCase() || null) !== (f.email?.trim().toLowerCase() || null);
-    const contactChanged = emailChanged || (before.phone || null) !== (f.phone || null);
+    const phoneChanged = (before.phone || null) !== (f.phone || null);
     const claim = ctx.db.transaction(() => {
       const updated = repo.updateClaim(before.itemId, patchFromFields(f)) ?? before;
-      if (emailChanged && repo.deleteDevices(before.itemId) > 0) {
+      if (emailChanged && repo.deleteDevices(before.itemId) + repo.retireLoginCodes(before.itemId) > 0) {
         log.info({ itemId: before.itemId }, 'intake: claim email changed; trusted browsers must verify again');
       }
       return updated;
     })();
-    return { claim, contactChanged };
+    return { claim, contactChanged: emailChanged || phoneChanged, formerPhone: phoneChanged ? before.phone || null : null };
   }
 
   // False when no HighLevel contact can safely be used (the notifier has told the team).
-  async function contactReady(claim: Claim): Promise<boolean> {
+  async function contactReady(claim: Claim, formerPhone: string | null = null): Promise<boolean> {
     try {
-      await services.notifier.ensureContact(claim);
+      await services.notifier.ensureContact(claim, { formerPhone });
       return true;
     } catch (err) {
       if (err instanceof ContactConflictError) return false;
@@ -130,9 +131,14 @@ export function createIntakeService(ctx: CoreContext, services: Services): Intak
 
   // After caching the board's fields: finish an intake that didn't complete, or
   // re-sync the contact when the claimant's email or phone changed.
-  async function afterFields(claim: Claim, f: ClaimFields, contactChanged: boolean, from: 'intake' | 'refresh'): Promise<void> {
+  async function afterFields(
+    claim: Claim,
+    f: ClaimFields,
+    changed: { contactChanged: boolean; formerPhone: string | null },
+    from: 'intake' | 'refresh',
+  ): Promise<void> {
     if (!intakeDone(claim.itemId)) await finishIntake(claim, f, from);
-    else if (contactChanged && (claim.email || claim.phone)) await contactReady(claim);
+    else if (changed.contactChanged && (claim.email || claim.phone)) await contactReady(claim, changed.formerPhone);
   }
 
   async function handleItemCreated(itemId: string): Promise<void> {
@@ -166,7 +172,7 @@ export function createIntakeService(ctx: CoreContext, services: Services): Intak
       (id, version) => services.tokens.tokenHash(services.tokens.portalToken(id, version)),
     );
     // A redelivery or retry picks up wherever the last run stopped; every step below is idempotent.
-    const { claim, contactChanged } = applyFields(created, f);
+    const { claim, ...changed } = applyFields(created, f);
     if (isNew) log.info({ itemId, claimNumber: claim.claimNumber }, 'intake: claim created');
 
     // Local steps first, so a Monday or HighLevel outage doesn't hold them up.
@@ -181,7 +187,7 @@ export function createIntakeService(ctx: CoreContext, services: Services): Intak
       );
     }
 
-    await afterFields(claim, f, contactChanged, 'intake');
+    await afterFields(claim, f, changed, 'intake');
   }
 
   async function refreshClaim(itemId: string): Promise<Claim | null> {
@@ -190,10 +196,10 @@ export function createIntakeService(ctx: CoreContext, services: Services): Intak
     const item = await fetchItem(itemId);
     if (!item || item.boardId !== board.claimsBoardId) return before;
     const f = readClaimFields(board, item);
-    const { claim, contactChanged } = applyFields(before, f);
+    const { claim, ...changed } = applyFields(before, f);
     // Also finishes an intake that stopped partway, e.g. one run inside a status
     // job that failed and is being retried (the claim row exists by then).
-    await afterFields(claim, f, contactChanged, 'refresh');
+    await afterFields(claim, f, changed, 'refresh');
     return repo.getClaim(itemId) ?? claim;
   }
 

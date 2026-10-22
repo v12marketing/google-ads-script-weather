@@ -71,7 +71,8 @@ export interface Notifier {
   // skipped (recorded via repo.markEventProcessed after each successful send).
   // Before sending, the contact is re-read from HighLevel: email goes only to a
   // contact whose email is claim.email, SMS only to one whose phone is
-  // claim.phone (else the SMS is skipped). Throws ContactConflictError (a
+  // claim.phone (else the SMS is skipped; a claim without an email is texted
+  // through a contact with its phone, whatever email that has). Throws ContactConflictError (a
   // PermanentJobError) when no such contact can be had; nothing is sent then.
   notify(claim: Claim, key: TemplateKey, extra?: Partial<TemplateVars>, opts?: { eventKey?: string }): Promise<NotifyResult>;
   // Sends one SMS outside the template system (STATUS replies). False when not
@@ -83,8 +84,11 @@ export interface Notifier {
   // different email: the phone is left off the upsert when it conflicts (texts
   // are then off for the claim, and the team is told once). Throws
   // ContactConflictError, after telling the team on the item, when HighLevel
-  // can't give such a contact.
-  ensureContact(claim: Claim): Promise<string>;
+  // can't give such a contact. formerPhone: the phone the board just replaced or
+  // cleared; it is taken off the claim's contacts that still have it (unless
+  // another claim on that contact has it), so it can't draw a later claim with
+  // that number onto them.
+  ensureContact(claim: Claim, opts?: { formerPhone?: string | null }): Promise<string>;
 }
 
 export interface IntakeService {
@@ -95,7 +99,7 @@ export interface IntakeService {
   // Refreshes the cached claim from the board (contact fields, status, amounts).
   // Finishes an intake that didn't complete. When the email or phone changed, the
   // HighLevel contact is synced again, and a changed email forgets the browsers
-  // trusted for the claim.
+  // trusted for the claim and retires its unused login codes.
   refreshClaim(itemId: string): Promise<Claim | null>;
 }
 

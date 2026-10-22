@@ -3,8 +3,17 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { nowIso } from '../src/db/index.js';
 import type { AppConfig } from '../src/config.js';
 import { PermanentJobError } from '../src/services/jobs.js';
-import { adminCsrfToken, clientKey, ConcurrencyLimit, FailureLimiter, hashPassword, parseBasicAuth, verifyPassword } from '../src/web/admin-auth.js';
-import { smsLength } from '../src/web/routes/admin.js';
+import {
+  adminCsrfToken,
+  clientKey,
+  ConcurrencyLimit,
+  FailureLimiter,
+  hashPassword,
+  parseBasicAuth,
+  VerifiedCredentialCache,
+  verifyPassword,
+} from '../src/web/admin-auth.js';
+import { MAX_PASSWORD_CHECKS, MAX_WAITING_PASSWORD_CHECKS, smsLength } from '../src/web/routes/admin.js';
 import { buildApp } from '../src/web/app.js';
 import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
 
@@ -116,6 +125,28 @@ describe('admin-auth', () => {
     gate.release();
     expect(gate.tryAcquire()).toBe(true);
   });
+
+  it('lets a few callers wait briefly for a slot, in turn, and turns the rest away', async () => {
+    const gate = new ConcurrencyLimit(1, 1);
+    expect(await gate.acquire(1000)).toBe(true);
+    const waiting = gate.acquire(1000);
+    expect(await gate.acquire(1000)).toBe(false); // one is waiting already
+    gate.release(); // the slot goes to the one waiting, not to whoever asks next
+    expect(await waiting).toBe(true);
+    expect(gate.tryAcquire()).toBe(false);
+    expect(await gate.acquire(20)).toBe(false); // nothing came free in time
+    gate.release();
+    expect(gate.tryAcquire()).toBe(true);
+  });
+
+  it('keeps a verified sign-in for as long as it keeps being used', () => {
+    const cache = new VerifiedCredentialCache('secret', 1000);
+    cache.add('Basic abc', 0);
+    expect(cache.has('Basic abc', 900)).toBe(true);
+    expect(cache.has('Basic abc', 1800)).toBe(true); // renewed at 900
+    expect(cache.has('Basic other', 1800)).toBe(false);
+    expect(cache.has('Basic abc', 2801)).toBe(false); // unused for longer than the TTL
+  });
 });
 
 describe('admin sign-in', () => {
@@ -157,7 +188,7 @@ describe('admin sign-in', () => {
     const burst = await Promise.all(Array.from({ length: 30 }, (_, i) => guess(`burst-${i}`)));
     let wrong = burst.filter((r) => r.statusCode === 401).length;
     expect(wrong).toBeGreaterThan(0);
-    expect(wrong).toBeLessThanOrEqual(2); // the rest were turned away, not checked
+    expect(wrong).toBeLessThanOrEqual(10); // the limit; the rest were turned away, not checked
     expect(burst.filter((r) => r.statusCode === 429)).toHaveLength(30 - wrong);
     for (let round = 0; round < 10; round++) {
       const rs = await Promise.all(Array.from({ length: 5 }, (_, i) => guess(`${round}-${i}`)));
@@ -168,14 +199,15 @@ describe('admin sign-in', () => {
     expect((await app.inject({ method: 'GET', url: '/admin', headers: AUTH(), remoteAddress: '198.51.100.9' })).statusCode).toBe(200);
   });
 
-  it('checks at most two passwords at once, from any number of addresses, and turns the rest away', async () => {
+  it('checks at most two passwords at once, lets a few more wait, from any number of addresses, and turns the rest away', async () => {
     const { app } = await setup();
     const burst = await Promise.all(
       Array.from({ length: 20 }, (_, i) =>
         app.inject({ method: 'GET', url: '/admin', headers: { authorization: basic('admin', `guess-${i}`) }, remoteAddress: `198.51.100.${i + 1}` }),
       ),
     );
-    expect(burst.filter((r) => r.statusCode === 401).length).toBeLessThanOrEqual(2);
+    expect(MAX_PASSWORD_CHECKS).toBe(2);
+    expect(burst.filter((r) => r.statusCode === 401).length).toBeLessThanOrEqual(MAX_PASSWORD_CHECKS + MAX_WAITING_PASSWORD_CHECKS);
     const busy = burst.find((r) => r.statusCode === 429)!;
     expect(busy.body).toContain('being checked right now');
     expect(busy.headers['retry-after']).toBe('5');

@@ -7,6 +7,7 @@ import { html, type Html } from '../web/html.js';
 import { columnText, errMessage, formatUsd, formatUtc, onceFor, parseAmount } from './claim-fields.js';
 import type { CoreContext, Services, SettlementService } from './contracts.js';
 import { RetryLaterError } from './jobs.js';
+import { ContactConflictError } from './notifier.js';
 
 // 'missing': the stored document isn't in HighLevel's document list (not yet, or
 // no longer: declined and deleted documents drop out of it).
@@ -46,6 +47,18 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
   // Open, or a send whose outcome isn't known yet: either way the contact's
   // claim_number / settlement_amount fields are in use.
   const isBusy = (c: Claim): boolean => !c.settlementSignedAt && (!!c.settlementSentAt || !!c.settlementAttemptAt);
+  // The contact the tracked document went to, and the one a send of unknown
+  // outcome went to. The claim's own contact may have moved on since (an email
+  // or phone edit re-syncs it); the document and its signer stay where they were.
+  const docContactOf = (c: Claim): string | null => c.settlementContactId ?? c.highlevelContactId;
+  const attemptContactOf = (c: Claim): string | null => c.settlementAttemptContactId ?? c.highlevelContactId;
+  // The contacts whose claim_number / settlement_amount fields the claim's open
+  // settlement (or unconfirmed send) relies on.
+  const settlementContacts = (c: Claim): string[] =>
+    [c.settlementSentAt ? docContactOf(c) : null, c.settlementAttemptAt ? attemptContactOf(c) : null].filter((v): v is string => !!v);
+  // Claims other than itemId with a settlement open on the contact.
+  const busyOn = (contactId: string, itemId?: string): Claim[] =>
+    repo.findClaimsUsingContact(contactId).filter((c) => c.itemId !== itemId && isBusy(c) && settlementContacts(c).includes(contactId));
   const ageMs = (iso: string | null): number => (iso ? Date.now() - Date.parse(iso) : 0);
   const money = (n: number | null): string => (n === null ? 'an unknown amount' : formatUsd(n));
   const offeredLabel = Object.entries(board.statuses).find(([, k]) => k === 'settlement_offered')?.[0] ?? 'Settlement offered';
@@ -69,11 +82,11 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
   // sends a second settlement and its signature is still recognised.
   async function discoverDocument(claim: Claim): Promise<Claim> {
     const itemId = claim.itemId;
-    const contactId = claim.highlevelContactId;
     const refs = repo.getSettlementRefs(itemId);
     const noIds = isOpen(claim) && !refs.documentId && !refs.referenceId;
     const attempt = claim.settlementSignedAt ? null : claim.settlementAttemptAt;
     const since = attempt ?? (noIds ? claim.settlementSentAt : null);
+    const contactId = attempt ? attemptContactOf(claim) : docContactOf(claim);
     if (!since || !contactId) return claim;
 
     // The document already tracked (an earlier offer still open) isn't the one.
@@ -84,9 +97,11 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
       repo.updateClaim(itemId, {
         settlementDocumentId: doc.documentId,
         settlementReferenceId: doc.referenceId,
+        settlementContactId: contactId,
         ...(attempt ? { settlementAmountSent: claim.settlementAttemptAmount, settlementSentAt: doc.createdAt ?? attempt } : {}),
         settlementAttemptAt: null,
         settlementAttemptAmount: null,
+        settlementAttemptContactId: null,
         settlementSeenAt: nowIso(),
         settlementSignUrl: doc.signUrl,
       }) ?? claim;
@@ -155,7 +170,7 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
           throw new RetryLaterError('settlement: an earlier send is unconfirmed; checking HighLevel for its document before sending again', wait);
         }
         unconfirmedAt = at;
-        claim = repo.updateClaim(itemId, { settlementAttemptAt: null, settlementAttemptAmount: null }) ?? claim;
+        claim = repo.updateClaim(itemId, { settlementAttemptAt: null, settlementAttemptAmount: null, settlementAttemptContactId: null }) ?? claim;
       }
     }
 
@@ -180,6 +195,19 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
       } else if (result !== 'void') {
         log.info({ itemId }, 'settlement: already sent for this amount');
         if (hasRefs(itemId)) await announceSent(claim);
+        const sentTo = docContactOf(claim);
+        if (sentTo && claim.highlevelContactId && sentTo !== claim.highlevelContactId) {
+          // The claimant's email or phone changed after the document went out, so
+          // it went to their old details and stays there.
+          await onceFor(ctx, `settlement-old-contact:${itemId}:${docKeyOf(itemId)}`, (once) =>
+            post(
+              itemId,
+              html`<p>Settlement offered, but no new document was sent: the one sent ${formatUtc(claim.settlementSentAt)} for this amount is still open for signing. It went to the claimant's email and phone as they were then, before they were changed on this item.</p>
+<p>If the claimant can't get to it, void it in HighLevel (Payments → Documents &amp; Contracts) and set the status to ${offeredLabel} again: a new document then goes to their current details.</p>`,
+              once,
+            ),
+          );
+        }
         return;
       }
       // Deleted, expired or gone in HighLevel: send a new one.
@@ -192,12 +220,26 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
       return;
     }
 
-    const contactId = await services.notifier.ensureContact(claim);
+    let contactId: string;
+    try {
+      contactId = await services.notifier.ensureContact(claim);
+    } catch (err) {
+      // The notifier explains the contact problem on the item only once; this
+      // says what it stopped this time. Still thrown, so the claimant isn't told
+      // about an offer that didn't go out.
+      if (err instanceof ContactConflictError) {
+        await post(
+          itemId,
+          html`<p>Settlement offered, but no document was sent: HighLevel has no contact that reaches only this claimant (see the note about their contact on this item). Once that is fixed, set the status to ${offeredLabel} again.</p>`,
+        );
+      }
+      throw err;
+    }
     claim = repo.getClaim(itemId) ?? claim;
 
     // claim_number and settlement_amount live on the HighLevel contact, shared by all
     // of that person's claims: a second open document would show the wrong values.
-    const blocking = repo.findClaimsByContact(contactId).filter((c) => c.itemId !== itemId && isBusy(c));
+    const blocking = busyOn(contactId, itemId);
     if (blocking.length) {
       await post(
         itemId,
@@ -241,7 +283,7 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
     // Recorded before the request: if it fails or times out, HighLevel may still
     // have sent the document, and the retry looks for it instead of sending another.
     const attemptAt = nowIso();
-    claim = repo.updateClaim(itemId, { settlementAttemptAt: attemptAt, settlementAttemptAmount: amount }) ?? claim;
+    claim = repo.updateClaim(itemId, { settlementAttemptAt: attemptAt, settlementAttemptAmount: amount, settlementAttemptContactId: contactId }) ?? claim;
     const refs = await highlevel.requestSettlementSignature({
       contactId,
       claimNumber: claim.claimNumber,
@@ -255,11 +297,13 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
       repo.updateClaim(itemId, {
         settlementDocumentId: refs.documentId,
         settlementReferenceId: refs.referenceId,
+        settlementContactId: contactId,
         settlementAmountSent: amount,
         // Without ids the poller looks for a document sent since the request started.
         settlementSentAt: tracked ? nowIso() : attemptAt,
         settlementAttemptAt: null,
         settlementAttemptAmount: null,
+        settlementAttemptContactId: null,
         settlementSeenAt: null,
         settlementSignUrl: null,
       }) ?? claim;
@@ -288,11 +332,12 @@ export function createSettlementService(ctx: CoreContext, services: Services): S
   async function verifyAndRecord(input: Claim): Promise<Verification> {
     if (input.settlementSignedAt) return 'signed';
     const itemId = input.itemId;
-    const contactId = input.highlevelContactId;
-    if (!contactId) return 'untracked';
+    if (!docContactOf(input) && !attemptContactOf(input)) return 'untracked';
     const claim = await discoverDocument(input);
     const refs = repo.getSettlementRefs(itemId);
-    if (!refs.documentId && !refs.referenceId) return 'untracked';
+    // The signer must be the contact the document went to.
+    const contactId = docContactOf(claim);
+    if ((!refs.documentId && !refs.referenceId) || !contactId) return 'untracked';
     const docKey = refs.documentId ?? refs.referenceId;
 
     const check = await highlevel.verifySignedDocument(refs, contactId, { sentAt: claim.settlementSentAt });
@@ -363,17 +408,19 @@ ${amountChanged ? html`<p><strong>Check the amount:</strong> the document was si
   // Webhook events carry little we can trust. Match by document id, else claim
   // number. The workflow's claim number is the contact's custom field, which
   // follows the contact's latest claim, so the contact's single open settlement
-  // wins over a claim-number match that has none open.
+  // wins over a claim-number match that has none open. The webhook comes from
+  // the contact the document went to, which may no longer be the claim's own.
   function findClaim(e: { contactId: string | null; documentId: string | null; claimNumber: string | null }): Claim | null {
     const byDocument = e.documentId ? repo.getClaimBySettlementDocument(e.documentId) : null;
     const byNumber = e.claimNumber ? repo.getClaimByNumber(e.claimNumber) : null;
-    const openForContact = e.contactId ? repo.findClaimsByContact(e.contactId).filter(isBusy) : [];
+    const openForContact = e.contactId ? busyOn(e.contactId) : [];
     const claim =
       byDocument ??
       (byNumber && isBusy(byNumber) ? byNumber : null) ??
       (openForContact.length === 1 ? openForContact[0]! : null) ??
       byNumber;
-    if (claim && e.contactId && claim.highlevelContactId && claim.highlevelContactId !== e.contactId) {
+    const known = claim ? [claim.highlevelContactId, claim.settlementContactId, claim.settlementAttemptContactId].filter((v): v is string => !!v) : [];
+    if (claim && e.contactId && known.length && !known.includes(e.contactId)) {
       log.warn({ itemId: claim.itemId }, 'settlement: webhook contact does not match the claim, ignoring');
       return null;
     }
@@ -447,7 +494,13 @@ ${amountChanged ? html`<p><strong>Check the amount:</strong> the document was si
     }
     // No longer open, so the poller stops checking it and a new document can go
     // out (to this or another of their claims).
-    repo.updateClaim(itemId, { settlementSentAt: null, settlementAttemptAt: null, settlementAttemptAmount: null, settlementSignUrl: null });
+    repo.updateClaim(itemId, {
+      settlementSentAt: null,
+      settlementAttemptAt: null,
+      settlementAttemptAmount: null,
+      settlementAttemptContactId: null,
+      settlementSignUrl: null,
+    });
   }
 
   // A send or document that can't be found, or identified, in HighLevel for long
@@ -475,7 +528,7 @@ ${amountChanged ? html`<p><strong>Check the amount:</strong> the document was si
       await giveUp(
         `settlement-gave-up:${itemId}:${attemptAt}`,
         html`<p>HighLevel didn't confirm an attempt to send the settlement document (${formatUtc(attemptAt)}, ${money(claim.settlementAttemptAmount)}), and no document from it has turned up there, so the integration has stopped looking for it.</p>`,
-        { settlementAttemptAt: null, settlementAttemptAmount: null },
+        { settlementAttemptAt: null, settlementAttemptAmount: null, settlementAttemptContactId: null },
       );
     }
     const sentAt = claim.settlementSentAt;

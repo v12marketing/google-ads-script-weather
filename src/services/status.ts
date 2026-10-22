@@ -36,14 +36,21 @@ export function createStatusService(ctx: CoreContext, services: Services): Statu
     // still the board's. A newer change has its own event, and refreshClaim has
     // already cached the board's current status: a stale event changes nothing,
     // sends nothing and never starts a settlement.
+    // An internal label is the exception: it never replaces the claimant-facing
+    // status (the claim page keeps showing it) and its event sends nothing. So
+    // while the board shows one, an event for the status the claim still shows
+    // is still due, e.g. a retry after its first attempt failed to send.
     const current = await boardStatusLabel(itemId);
-    if (current === undefined || normLabel(current) !== normLabel(label)) {
+    const labelKey = statusKeyForLabel(board, label);
+    const stillShown =
+      current !== undefined && statusKeyForLabel(board, current) === null && labelKey !== null && labelKey === claim.statusKey;
+    if (current === undefined || (normLabel(current) !== normLabel(label) && !stillShown)) {
       log.info({ itemId, eventId }, 'status: stale status event (the board has moved on, or the item is gone), ignoring');
       if (doneKey) repo.markEventProcessed(doneKey);
       return;
     }
 
-    const statusLabel = current;
+    const statusLabel = stillShown ? (claim.statusLabel ?? label) : current;
     const key = statusKeyForLabel(board, statusLabel);
     if (!key || !statusLabel) {
       // Internal label: nothing for the claimant.

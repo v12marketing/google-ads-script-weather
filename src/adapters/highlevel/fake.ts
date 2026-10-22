@@ -1,4 +1,5 @@
 import type {
+  ContactDetails,
   ContactIdentity,
   ContactInput,
   HighLevelApi,
@@ -76,6 +77,15 @@ export class FakeHighLevel implements HighLevelApi {
     this.maybeFail('getContact', [contactId]);
     const c = this.contacts.get(contactId);
     return c ? this.identity(c) : null;
+  }
+
+  async updateContact(contactId: string, details: ContactDetails): Promise<void> {
+    this.maybeFail('updateContact', [contactId, details]);
+    const c = this.contacts.get(contactId);
+    if (!c) return;
+    const { customFields, ...rest } = details;
+    for (const [k, v] of Object.entries(rest)) if (v !== undefined) Object.assign(c, { [k]: v });
+    if (customFields) Object.assign(c.customFields, customFields);
   }
 
   private identity(c: { id: string; email: string | null; phone: string | null }): ContactIdentity {

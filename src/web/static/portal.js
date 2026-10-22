@@ -113,6 +113,17 @@
 
     input.addEventListener('change', showSummary);
 
+    // The claim page with the new files, as the form's own response would show
+    // it. A URL that differs from this one only in its #fragment wouldn't load
+    // the page (just scroll), so then it is reloaded.
+    function showClaimPage(added) {
+      var target = claimUrl + '?uploaded=' + added;
+      if (location.pathname + location.search === target) {
+        location.hash = 'files';
+        location.reload();
+      } else location.assign(target + '#files');
+    }
+
     function alertBox(kind, role) {
       var box = document.createElement('div');
       box.className = 'alert alert-' + kind;
@@ -134,6 +145,10 @@
         var link = document.createElement('a');
         link.href = claimUrl + '?uploaded=' + added + '#files';
         link.textContent = 'Show them';
+        link.addEventListener('click', function (e) {
+          e.preventDefault();
+          showClaimPage(added);
+        });
         ok.appendChild(link);
         form.insertBefore(ok, field);
       }
@@ -202,10 +217,7 @@
           errors.push({ name: null, message: stop + ' Not added: ' + left.join(', ') + '.' });
         }
         if (!errors.length) {
-          // Show the claim page with the new files, as the form's own response would.
-          var target = claimUrl + '?uploaded=' + added + '#files';
-          if (location.pathname + location.search + location.hash === target) location.reload();
-          else location.assign(target);
+          showClaimPage(added);
           return;
         }
         showOutcome(added, errors);

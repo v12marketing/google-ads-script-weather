@@ -428,6 +428,45 @@ describe('handleInbound', () => {
   });
 });
 
+describe("handleInbound from a claim's previous contact", () => {
+  it('files a reply to the old address on the claim, with a note for the team, and ignores its keywords', async () => {
+    const env = makeTestEnv({ config: { SMS_ENABLED: true } });
+    const item = addClaimItem(env, { email: 'jane@example.com', phone: '' });
+    await env.ctx.services.intake.handleItemCreated(item.id);
+    const old = env.ctx.repo.getClaim(item.id)!.highlevelContactId!;
+    env.monday.setText(item.id, env.board.columns.email, 'jane@work.example', 'email');
+    await env.ctx.services.intake.refreshClaim(item.id);
+    const claim = env.ctx.repo.getClaim(item.id)!;
+    expect(claim.highlevelContactId).not.toBe(old);
+    await env.ctx.jobs.drain();
+    const postsBefore = env.monday.callsTo('createUpdate').length;
+
+    const { messaging } = env.ctx.services;
+    await messaging.handleInbound(inbound('Here is my receipt', { channel: 'email', contactId: old, subject: `Re: claim ${claim.claimNumber}`, messageId: 'hl_old_1' }));
+    await messaging.handleInbound(inbound('STOP', { contactId: old, messageId: 'hl_old_2' }));
+    await messaging.handleInbound(inbound('Hello?', { contactId: 'contact_never_used' }));
+
+    const msgs = env.ctx.repo.listMessages(item.id).filter((m) => m.direction === 'from_claimant');
+    expect(msgs.map((m) => [m.channel, m.body])).toEqual([['email', 'Here is my receipt']]);
+    expect(env.ctx.repo.getClaim(item.id)!.smsOptedOut).toBe(false);
+    await env.ctx.jobs.drain();
+    const posts = env.monday.callsTo('createUpdate').slice(postsBefore);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]![0]).toBe(item.id);
+    expect(posts[0]![1]).toContain('From claimant (email):');
+    expect(posts[0]![1]).toContain('came from the email address or phone number this claim had before it was changed');
+  });
+
+  it('a reply to the current contact gets no such note', async () => {
+    const env = makeTestEnv();
+    const claim = makeClaim(env);
+    await env.ctx.services.messaging.handleInbound(inbound('Thanks', { channel: 'email' }));
+    await env.ctx.jobs.drain();
+    expect(env.monday.callsTo('createUpdate').at(-1)![1]).not.toContain('before it was changed');
+    expect(env.ctx.repo.listMessages(claim.itemId)).toHaveLength(1);
+  });
+});
+
 describe('handleInbound with several claims on one contact', () => {
   // Two open claims (HDC-000001 older, HDC-000002 newer) and a closed one.
   function threeClaims(env: TestEnv) {

@@ -22,7 +22,9 @@ photo column may arrive after `create_item`, so intake schedules delayed file sy
 **Status change.** `change_status_column_value` → job → `status`: map the label to
 a `StatusKey` via `config/board.json`; unknown labels are internal (no message).
 The board's current label is read first: an event that no longer matches it (a
-late retry or redelivery) is stale and does nothing. Otherwise send the template
+late retry or redelivery) is stale and does nothing, unless the board has moved
+on only to an internal label and the event's status is still the one the claim
+page shows (e.g. a retry after a failed send). Otherwise send the template
 for that status. `settlement_offered` also starts the settlement.
 
 **Contact identity.** HighLevel sends to a contact's own email/phone and its
@@ -31,13 +33,20 @@ contact whose email is the claim's (texts: whose phone is), re-read from
 HighLevel before every send, and an upsert never rewrites the email of another
 claim's contact (the phone is left off instead, and texts are off for that
 claim). When no such contact can be had, nothing is sent and the team is told.
-An email or phone edit on the board (subscribed column) refreshes the claim and
-re-syncs the contact; an email change also forgets the claim's trusted browsers.
+A claim without an email is only texted, through a contact with its phone
+(whatever email that has). An email or phone edit on the board (subscribed
+column) refreshes the claim and re-syncs the contact; an email change also
+forgets the claim's trusted browsers and unused login codes. A phone the claim
+no longer has is taken off its contacts (the upsert never clears one), and an
+upsert that gave another claim's contact this claim's email (HighLevel had the
+number on it) puts that claim's details back first.
 
 **Settlement.** `settlement` writes `claim_number` / `settlement_amount` to the
 HighLevel contact's custom fields, sends the Documents & Contracts template
-(`POST /proposals/templates/send`) and stores both returned ids and the amount
-sent. A HighLevel workflow (trigger: Documents & Contracts, Status = Completed,
+(`POST /proposals/templates/send`) and stores both returned ids, the amount
+sent and the contact it went to: the claim's own contact can change while the
+document is out (an email or phone edit), and its signature check, webhooks and
+the one-open-settlement rule stay with the document's contact. A HighLevel workflow (trigger: Documents & Contracts, Status = Completed,
 Template = Settlement; action: Webhook) calls `POST /webhooks/highlevel/<secret>`.
 We never trust that call alone: `verifySignedDocument` checks status, expiry and
 every signer's `hasCompleted` + `signedDate` via `GET /proposals/document`. When
@@ -70,7 +79,8 @@ job posts it as an update (`From claimant (portal): …`) and notifies
 Customer Replied; action: Webhook) or a marketplace `InboundMessage` webhook →
 posted to the item the same way: the claim whose number (`HDC-…`) the subject or
 text names, else the contact's newest open claim (the team is told about the
-others). An SMS that is just `STATUS` gets an automatic reply per open claim
+others). A reply from a contact a claim had before its email or phone changed
+is filed on that claim, with a note for the team (keywords from it are ignored). An SMS that is just `STATUS` gets an automatic reply per open claim
 instead. `STOP` marks the claim opted out of SMS. Updates without the prefix are
 internal: never sent, and never stored (not even in the job queue).
 

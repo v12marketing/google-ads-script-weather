@@ -11,6 +11,7 @@ import { registerPublicRoutes } from './routes/public.js';
 import { registerPortalRoutes } from './routes/portal.js';
 import { registerWebhookRoutes } from './routes/webhooks.js';
 import { registerAdminRoutes } from './routes/admin.js';
+import { clientKey } from './admin-auth.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // Static assets are read from src/ in dev and from dist/src/ after build; the
@@ -57,7 +58,8 @@ export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   await app.register(cookie, { secret: ctx.config.APP_SECRET });
   await app.register(formbody);
   await app.register(multipart, { limits: { fileSize: ctx.config.MAX_UPLOAD_BYTES, files: 10 } });
-  await app.register(rateLimit, { global: false });
+  // Per client address; an IPv6 client usually holds a whole /64, so per /64.
+  await app.register(rateLimit, { global: false, keyGenerator: (req) => clientKey(req.ip) });
   await app.register(fastifyStatic, { root: STATIC_DIR, prefix: '/static/', maxAge: '1d' });
 
   app.addHook('onSend', async (_req, reply, payload) => {

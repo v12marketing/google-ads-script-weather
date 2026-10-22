@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { RetryLaterError } from '../src/services/jobs.js';
 import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
 
 async function setup(o: Parameters<typeof addClaimItem>[1] = {}) {
@@ -182,6 +183,36 @@ describe('status.handleStatusChanged', () => {
       expect(notify).not.toHaveBeenCalled();
       expect(env.highlevel.emails).toHaveLength(0);
       expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'received', statusLabel: 'New' });
+    });
+
+    it('a retry still sends the status the claim page shows when the board has since moved only to an internal label', async () => {
+      const { env, item, notify } = await setup({ smsOptIn: false });
+      env.highlevel.failNext = 1;
+      await expect(setStatus(env, item.id, 'More info needed', 'evt-1')).rejects.toThrow(/simulated failure/);
+      expect(env.ctx.repo.getClaim(item.id)!.statusKey).toBe('more_info_needed');
+      await setStatus(env, item.id, 'Waiting on carrier', 'evt-2');
+
+      await env.ctx.services.status.handleStatusChanged(item.id, 'More info needed', 'evt-1');
+      expect(env.highlevel.emails).toHaveLength(1);
+      expect(notify.mock.calls.map((c) => c[1])).toEqual(['more_info_needed', 'more_info_needed']);
+      expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'more_info_needed', statusLabel: 'More info needed' });
+      expect(systemMessages(env, item.id).filter((m) => m.startsWith('Status updated'))).toEqual(['Status updated: More info needed']);
+    });
+
+    it('a deferred "Settlement offered" still sends the document after the board moved to an internal label', async () => {
+      const { env, item } = await setup();
+      env.monday.setText(item.id, env.board.columns.settlementAmount, '900', 'numbers');
+      // The send times out before HighLevel created anything; the retry waits for it to turn up.
+      vi.spyOn(env.highlevel, 'requestSettlementSignature').mockRejectedValueOnce(new Error('HighLevel POST /proposals/templates/send timed out after 20s'));
+      await expect(setStatus(env, item.id, 'Settlement offered', 'evt-1')).rejects.toThrow(/timed out/);
+      await expect(env.ctx.services.status.handleStatusChanged(item.id, 'Settlement offered', 'evt-1')).rejects.toBeInstanceOf(RetryLaterError);
+      await setStatus(env, item.id, 'Awaiting signature', 'evt-2');
+
+      env.ctx.repo.updateClaim(item.id, { settlementAttemptAt: new Date(Date.now() - 11 * 60_000).toISOString() });
+      await env.ctx.services.status.handleStatusChanged(item.id, 'Settlement offered', 'evt-1');
+      expect(env.highlevel.settlementRequests).toHaveLength(1);
+      expect(env.highlevel.emails.map((e) => e.subject)).toEqual(['Your settlement offer for claim HDC-000001 is ready']);
+      expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'settlement_offered', settlementAttemptAt: null });
     });
 
     it('caches the label as the board writes it', async () => {

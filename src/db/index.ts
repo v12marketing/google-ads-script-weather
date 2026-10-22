@@ -149,6 +149,29 @@ const MIGRATIONS: string[] = [
   -- The claimant's own signing link for the open document (recipients[].shareLink).
   ALTER TABLE claims ADD COLUMN settlement_sign_url TEXT;
   `,
+  `
+  -- The HighLevel contact the tracked settlement document was sent to, and the
+  -- one a send of unknown outcome went to. The claim's own contact can change
+  -- while a document is out (an email or phone edit re-syncs it); the document,
+  -- its signature and its webhooks stay with the contact it was sent to.
+  ALTER TABLE claims ADD COLUMN settlement_contact_id TEXT;
+  ALTER TABLE claims ADD COLUMN settlement_attempt_contact_id TEXT;
+  UPDATE claims SET settlement_contact_id = highlevel_contact_id
+    WHERE settlement_document_id IS NOT NULL OR settlement_reference_id IS NOT NULL OR settlement_sent_at IS NOT NULL;
+  UPDATE claims SET settlement_attempt_contact_id = highlevel_contact_id WHERE settlement_attempt_at IS NOT NULL;
+  CREATE INDEX claims_settlement_contact ON claims(settlement_contact_id);
+  CREATE INDEX claims_settlement_attempt_contact ON claims(settlement_attempt_contact_id);
+
+  -- HighLevel contacts a claim used before its current one, so replies that still
+  -- come from an old one reach the claim (services/messaging.ts).
+  CREATE TABLE claim_previous_contacts (
+    item_id TEXT NOT NULL REFERENCES claims(item_id),
+    contact_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (item_id, contact_id)
+  );
+  CREATE INDEX claim_previous_contacts_contact ON claim_previous_contacts(contact_id);
+  `,
 ];
 
 export function openDb(dataDir: string): Db {
