@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { isIPv6 } from 'node:net';
 
 // Admin password hashing (scrypt) and the pieces of HTTP Basic auth the admin
 // routes need. Hash format: scrypt$<saltB64>$<hashB64>, N=16384 r=8 p=1, 64 bytes.
@@ -54,10 +55,13 @@ export function adminCsrfToken(appSecret: string, adminUser: string): string {
   return createHmac('sha256', appSecret).update(`admin-csrf:${adminUser}`).digest('base64url');
 }
 
-// Counts failed sign-ins per client IP in a fixed window. In memory: a restart
-// clears it, which is acceptable for a single-instance service.
+// Counts sign-in attempts per client in a fixed window: failures, plus
+// attempts still being checked, so guesses sent all at once can't get past the
+// limit before the first ones fail. In memory: a restart clears it, which is
+// acceptable for a single-instance service.
 export class FailureLimiter {
   private entries = new Map<string, { count: number; resetAt: number }>();
+  private inFlight = new Map<string, number>();
 
   constructor(
     readonly maxFailures = 10,
@@ -67,11 +71,29 @@ export class FailureLimiter {
   // Seconds until the key may try again, or 0 if it isn't blocked.
   blockedFor(key: string, now = Date.now()): number {
     const e = this.entries.get(key);
-    if (!e || e.resetAt <= now) return 0;
-    return e.count >= this.maxFailures ? Math.ceil((e.resetAt - now) / 1000) : 0;
+    const failures = e && e.resetAt > now ? e.count : 0;
+    if (failures + (this.inFlight.get(key) ?? 0) < this.maxFailures) return 0;
+    return failures ? Math.ceil((e!.resetAt - now) / 1000) : 1;
+  }
+
+  // Call synchronously before checking a password. False (and nothing counted)
+  // when the key is blocked; otherwise end the attempt with fail(), succeed()
+  // or cancel().
+  begin(key: string, now = Date.now()): boolean {
+    if (this.blockedFor(key, now)) return false;
+    this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1);
+    return true;
+  }
+
+  // The attempt was turned away before its password was checked.
+  cancel(key: string): void {
+    const n = (this.inFlight.get(key) ?? 0) - 1;
+    if (n > 0) this.inFlight.set(key, n);
+    else this.inFlight.delete(key);
   }
 
   fail(key: string, now = Date.now()): void {
+    this.cancel(key);
     const e = this.entries.get(key);
     if (!e || e.resetAt <= now) this.entries.set(key, { count: 1, resetAt: now + this.windowMs });
     else e.count++;
@@ -79,11 +101,57 @@ export class FailureLimiter {
   }
 
   succeed(key: string): void {
+    this.cancel(key);
     this.entries.delete(key);
   }
 
   private prune(now: number): void {
     for (const [k, e] of this.entries) if (e.resetAt <= now) this.entries.delete(k);
+  }
+}
+
+// The limiter key for a client address. An IPv6 client usually holds a whole
+// /64, so it is counted per /64; IPv4 (and IPv4-mapped IPv6) per address.
+export function clientKey(ip: string): string {
+  const addr = ip.split('%')[0]!;
+  if (!isIPv6(addr)) return ip;
+  const groups = (s: string): number[] =>
+    s
+      ? s.split(':').flatMap((g) => {
+          if (!g.includes('.')) return [parseInt(g, 16)];
+          const [a, b, c, d] = g.split('.').map(Number) as [number, number, number, number];
+          return [(a << 8) | b, (c << 8) | d];
+        })
+      : [];
+  const [head = '', tail] = addr.split('::');
+  const h = groups(head);
+  const t = tail === undefined ? [] : groups(tail);
+  const all = [...h, ...Array<number>(8 - h.length - t.length).fill(0), ...t];
+  if (all.slice(0, 5).every((g) => g === 0) && all[5] === 0xffff) {
+    return [all[6]! >> 8, all[6]! & 255, all[7]! >> 8, all[7]! & 255].join('.');
+  }
+  return `${all
+    .slice(0, 4)
+    .map((g) => g.toString(16))
+    .join(':')}::/64`;
+}
+
+// At most `max` slow operations (password hashing) at once. Callers that find
+// it full are turned away rather than queued: scrypt runs on libuv's small
+// thread pool, which file reads and DNS lookups for every request share.
+export class ConcurrencyLimit {
+  private active = 0;
+
+  constructor(readonly max: number) {}
+
+  tryAcquire(): boolean {
+    if (this.active >= this.max) return false;
+    this.active++;
+    return true;
+  }
+
+  release(): void {
+    if (this.active > 0) this.active--;
   }
 }
 

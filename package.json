@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "hash-password": "tsx scripts/hash-password.ts",
+    "backup": "tsx scripts/backup.ts",
     "monday:setup": "tsx scripts/monday-setup.ts",
     "highlevel:setup": "tsx scripts/highlevel-setup.ts"
   },

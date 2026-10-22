@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { AppConfig } from '../../config.js';
-import type { MondayApi, MondayAsset, MondayColumnValue, MondayItem, MondayUpdate } from './types.js';
+import type { MondayApi, MondayAsset, MondayColumnValue, MondayItem, MondayUpdate, MondayWriteOptions } from './types.js';
 import { htmlToText } from './webhook.js';
 
 const API_URL = 'https://api.monday.com/v2';
@@ -230,9 +230,11 @@ export class MondayClient implements MondayApi {
 
   // Runs one GraphQL operation. Mutations carry an Idempotency-Key (honoured by
   // Monday for 30 minutes), so retrying one after a timeout can't apply it twice.
-  async query<T>(query: string, variables: Record<string, unknown> = {}, op = 'request'): Promise<T> {
+  // A caller's key (opts) also covers retries of the whole job; otherwise a fresh
+  // one covers this call's own retries.
+  async query<T>(query: string, variables: Record<string, unknown> = {}, op = 'request', opts: MondayWriteOptions = {}): Promise<T> {
     const headers: Record<string, string> = { ...this.authHeaders(), 'Content-Type': 'application/json' };
-    if (/^\s*mutation\b/.test(query)) headers['Idempotency-Key'] = randomUUID();
+    if (/^\s*mutation\b/.test(query)) headers['Idempotency-Key'] = opts.idempotencyKey ?? randomUUID();
     const body = JSON.stringify({ query, variables });
     return this.send<T>(op, () => fetch(API_URL, { method: 'POST', headers, body, signal: AbortSignal.timeout(TIMEOUT_MS) }), true);
   }
@@ -334,17 +336,18 @@ export class MondayClient implements MondayApi {
     );
   }
 
-  async createUpdate(itemId: string, body: string): Promise<string> {
-    const data = await this.query<{ create_update: { id: string } | null }>(CREATE_UPDATE, { itemId: checkId(itemId), body }, 'createUpdate');
+  async createUpdate(itemId: string, body: string, opts: MondayWriteOptions = {}): Promise<string> {
+    const data = await this.query<{ create_update: { id: string } | null }>(CREATE_UPDATE, { itemId: checkId(itemId), body }, 'createUpdate', opts);
     if (!data.create_update?.id) throw new MondayApiError('Monday createUpdate returned no update id');
     return String(data.create_update.id);
   }
 
-  async notifyUser(userId: string, itemId: string, text: string): Promise<void> {
+  async notifyUser(userId: string, itemId: string, text: string, opts: MondayWriteOptions = {}): Promise<void> {
     await this.query(
       NOTIFY,
       { userId: checkId(userId), targetId: checkId(itemId), text, targetType: 'Project' },
       'notifyUser',
+      opts,
     );
   }
 

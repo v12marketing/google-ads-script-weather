@@ -11,11 +11,14 @@ import {
   type TemplateKey,
   type TemplateVars,
 } from '../../domain/types.js';
+import { BUSINESS_TIME_ZONE } from '../../services/claim-fields.js';
 import type { AppContext } from '../../services/contracts.js';
 import type { JobRow } from '../../services/jobs.js';
 import { EMAIL_ONLY_TEMPLATE_KEYS, formatDate, formatMoney } from '../../services/templates.js';
 import {
   adminCsrfToken,
+  clientKey,
+  ConcurrencyLimit,
   FailureLimiter,
   parseBasicAuth,
   safeEqualStrings,
@@ -26,8 +29,9 @@ import { html, raw, textToHtml, type Html } from '../html.js';
 import { page } from '../layout.js';
 
 // The team's admin page: /admin. HTTP Basic auth against ADMIN_USER /
-// ADMIN_PASSWORD_HASH, failed attempts limited per IP. Every POST carries a CSRF
-// token and must come from our own origin. Never shows portal tokens.
+// ADMIN_PASSWORD_HASH, attempts limited per IP (per /64 for IPv6) and only a
+// couple of password checks at once. Every POST carries a CSRF token and must
+// come from our own origin. Never shows portal tokens.
 
 const REALM = 'Basic realm="Home Delivery Claims admin", charset="UTF-8"';
 const CSP =
@@ -36,6 +40,12 @@ const CSP =
 const TEMPLATE_KEYS: readonly TemplateKey[] = [...STATUS_KEYS, ...EVENT_TEMPLATE_KEYS];
 // Only the text message of these is ever sent.
 const SMS_ONLY_TEMPLATE_KEYS: ReadonlySet<TemplateKey> = new Set<TemplateKey>(['status_reply']);
+// Only the claim page text of these is used. A new claim is sent the
+// confirmation's email and text, and the received status is sent under the
+// same event key (status.ts), so its own email and text never go out.
+const PORTAL_ONLY_TEMPLATE_KEYS: ReadonlySet<TemplateKey> = new Set<TemplateKey>(['received']);
+// Password checks (scrypt) running at once, across all clients.
+const MAX_PASSWORD_CHECKS = 2;
 // Placeholders a template must keep, or the message is useless.
 const REQUIRED_VARS: Partial<Record<TemplateKey, Array<keyof TemplateVars>>> = {
   login_code: ['code'],
@@ -93,7 +103,7 @@ const field = (body: unknown, name: string): string | undefined => {
 const query = (req: FastifyRequest, name: string): string | undefined => field(req.query, name);
 
 const dateTimeFormat = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/New_York',
+  timeZone: BUSINESS_TIME_ZONE,
   month: 'short',
   day: 'numeric',
   year: 'numeric',
@@ -180,6 +190,7 @@ export async function registerAdminRoutes(app: FastifyInstance, ctx: AppContext)
   const { config, board, db, repo, jobs, services, monday, highlevel, log } = ctx;
   const csrf = adminCsrfToken(config.APP_SECRET, config.ADMIN_USER);
   const limiter = new FailureLimiter();
+  const passwordChecks = new ConcurrencyLimit(MAX_PASSWORD_CHECKS);
   const verified = new VerifiedCredentialCache(config.APP_SECRET);
   const baseUrl = config.PUBLIC_BASE_URL.replace(/\/+$/, '');
   const publicOrigin = new URL(config.PUBLIC_BASE_URL).origin;
@@ -243,26 +254,49 @@ export async function registerAdminRoutes(app: FastifyInstance, ctx: AppContext)
         return payload;
       });
 
+      const tooManyAttempts = (reply: FastifyReply, wait: number): FastifyReply => {
+        reply.header('Retry-After', String(wait));
+        const minutes = Math.ceil(wait / 60);
+        return send(
+          reply,
+          429,
+          'Too many attempts',
+          message('Too many sign-in attempts', `Please wait about ${minutes === 1 ? 'a minute' : `${minutes} minutes`} and try again.`),
+        );
+      };
+
       admin.addHook('onRequest', async (req, reply) => {
         const ip = req.ip;
-        const wait = limiter.blockedFor(ip);
-        if (wait) {
-          reply.header('Retry-After', String(wait));
-          return send(reply, 429, 'Too many attempts', message('Too many sign-in attempts', `Please wait about ${Math.ceil(wait / 60)} minutes and try again.`));
-        }
+        const key = clientKey(ip);
+        const wait = limiter.blockedFor(key);
+        if (wait) return tooManyAttempts(reply, wait);
         const header = req.headers.authorization;
         if (header && verified.has(header)) return;
         const creds = parseBasicAuth(header);
         if (creds) {
-          // Both checks always run, so timing doesn't reveal which one failed.
-          const userOk = safeEqualStrings(creds.user, config.ADMIN_USER);
-          const passOk = await verifyPassword(creds.password, config.ADMIN_PASSWORD_HASH);
-          if (userOk && passOk) {
-            limiter.succeed(ip);
+          // Counted before the (slow) check, so guesses sent all at once can't
+          // get past the limit before the first ones have failed.
+          if (!limiter.begin(key)) return tooManyAttempts(reply, limiter.blockedFor(key) || 1);
+          if (!passwordChecks.tryAcquire()) {
+            limiter.cancel(key);
+            reply.header('Retry-After', '5');
+            return send(reply, 429, 'Busy', message('Too many sign-in attempts', 'Too many sign-ins are being checked right now. Please try again in a few seconds.'));
+          }
+          let ok = false;
+          try {
+            // Both checks always run, so timing doesn't reveal which one failed.
+            const userOk = safeEqualStrings(creds.user, config.ADMIN_USER);
+            const passOk = await verifyPassword(creds.password, config.ADMIN_PASSWORD_HASH);
+            ok = userOk && passOk;
+          } finally {
+            passwordChecks.release();
+            if (ok) limiter.succeed(key);
+            else limiter.fail(key);
+          }
+          if (ok) {
             verified.add(header!);
             return;
           }
-          limiter.fail(ip);
           log.warn({ ip }, 'admin: sign-in failed');
         }
         reply.header('WWW-Authenticate', REALM);
@@ -352,8 +386,12 @@ ${claimSearchForm('')}
         if (!isStatusKey(key)) return EVENTS[key].when;
         const labels = boardLabels(key);
         if (!labels.length) return 'No board status label is mapped to this status, so it is never sent.';
+        const quoted = labels.map((l) => `"${l}"`).join(' or ');
+        if (PORTAL_ONLY_TEMPLATE_KEYS.has(key)) {
+          return `Only the claim page text is used (shown while the status is ${quoted}). No email or text is sent for this status: new claims get the "${EVENTS.confirmation.name}" email and text instead, and moving a claim back to ${quoted} sends nothing.`;
+        }
         const extra = key === 'settlement_offered' ? ' This also sends the settlement document for e-signature.' : '';
-        return `Sent when the claim's status changes to ${labels.map((l) => `"${l}"`).join(' or ')}.${extra}`;
+        return `Sent when the claim's status changes to ${quoted}.${extra}`;
       };
 
       const sampleVars = (key: TemplateKey): TemplateVars => {
@@ -416,6 +454,7 @@ ${claimSearchForm('')}
         const def = services.templates.getDefault(key);
         const emailOnly = EMAIL_ONLY_TEMPLATE_KEYS.has(key);
         const smsOnly = SMS_ONLY_TEMPLATE_KEYS.has(key);
+        const portalOnly = PORTAL_ONLY_TEMPLATE_KEYS.has(key);
         const status = isStatusKey(key);
         const vars = sampleVars(key);
         const render = (text: string) => services.templates.render(text, vars);
@@ -425,10 +464,10 @@ ${claimSearchForm('')}
           ? html`<section class="card preview" aria-labelledby="preview-title">
   <h2 id="preview-title">Preview</h2>
   <p class="muted small">Filled in with sample values. Nothing has been saved or sent.</p>
-  ${smsOnly ? '' : html`<h3>Email</h3>
+  ${smsOnly || portalOnly ? '' : html`<h3>Email</h3>
   <p><strong>Subject:</strong> ${render(t.emailSubject)}</p>
   <div class="preview-email">${textToHtml(render(t.emailBody))}</div>`}
-  ${emailOnly ? '' : html`<h3>Text message</h3>
+  ${emailOnly || portalOnly ? '' : html`<h3>Text message</h3>
   ${t.sms.trim() ? html`<p class="preview-sms">${render(t.sms)}</p>` : html`<p class="muted">No text message is sent for this.</p>`}
   <p class="small muted">${smsSummary(render(t.sms))}</p>`}
   ${status ? html`<h3>Claim page</h3><div class="preview-portal">${textToHtml(render(t.portalText))}</div>` : ''}
@@ -443,7 +482,10 @@ ${s.problems?.length ? alert('error', html`<p>Not saved. Please fix:</p><ul>${s.
 ${preview}
 <form method="post" action="/admin/templates/${key}" class="template-form">
   ${csrfInput()}
-  ${smsOnly
+  ${portalOnly
+    ? html`<p class="muted small">There is no email or text message to edit here. To change what new claims are sent, edit <a href="/admin/templates/confirmation">${EVENTS.confirmation.name}</a>.</p>`
+    : ''}
+  ${smsOnly || portalOnly
     ? ''
     : html`<label class="field"><span>Email subject</span>
     <input type="text" name="emailSubject" value="${t.emailSubject}" maxlength="200">
@@ -451,7 +493,9 @@ ${preview}
   <label class="field"><span>Email body</span>
     <textarea name="emailBody" rows="16">${t.emailBody}</textarea>
     <span class="hint">Plain text. Leave a blank line between paragraphs. ${chars(t.emailBody)}.</span></label>`}
-  ${emailOnly
+  ${portalOnly
+    ? ''
+    : emailOnly
     ? html`<p class="muted small">This message is only ever sent by email.</p>`
     : html`<label class="field"><span>Text message</span>
     <textarea name="sms" rows="4">${t.sms}</textarea>
@@ -477,8 +521,8 @@ ${preview}
 
 <details class="default-text">
   <summary>Original wording</summary>
-  ${smsOnly ? '' : html`<p><strong>Subject:</strong> ${def.emailSubject}</p><pre class="plaintext">${def.emailBody}</pre>`}
-  ${emailOnly ? '' : html`<p><strong>Text message:</strong></p><pre class="plaintext">${def.sms || '(none)'}</pre>`}
+  ${smsOnly || portalOnly ? '' : html`<p><strong>Subject:</strong> ${def.emailSubject}</p><pre class="plaintext">${def.emailBody}</pre>`}
+  ${emailOnly || portalOnly ? '' : html`<p><strong>Text message:</strong></p><pre class="plaintext">${def.sms || '(none)'}</pre>`}
   ${status ? html`<p><strong>Claim page text:</strong></p><pre class="plaintext">${def.portalText}</pre>` : ''}
 </details>
 
@@ -510,11 +554,12 @@ ${edited
         const body = req.body;
         // Fields a template doesn't use keep their stored value.
         const smsOnly = SMS_ONLY_TEMPLATE_KEYS.has(key);
+        const portalOnly = PORTAL_ONLY_TEMPLATE_KEYS.has(key);
         const t: MessageTemplate = {
           key,
-          emailSubject: smsOnly ? current.emailSubject : (field(body, 'emailSubject') ?? ''),
-          emailBody: smsOnly ? current.emailBody : (field(body, 'emailBody') ?? ''),
-          sms: EMAIL_ONLY_TEMPLATE_KEYS.has(key) ? '' : (field(body, 'sms') ?? ''),
+          emailSubject: smsOnly || portalOnly ? current.emailSubject : (field(body, 'emailSubject') ?? ''),
+          emailBody: smsOnly || portalOnly ? current.emailBody : (field(body, 'emailBody') ?? ''),
+          sms: EMAIL_ONLY_TEMPLATE_KEYS.has(key) ? '' : portalOnly ? current.sms : (field(body, 'sms') ?? ''),
           portalText: isStatusKey(key) ? (field(body, 'portalText') ?? '') : '',
         };
         const problems = templateProblems(t);
@@ -710,7 +755,7 @@ ${claimFlash(c, f)}
   <form method="post" action="/admin/claims/${c.itemId}/replace-link" class="card danger-zone">
     ${csrfInput()}
     <h2>Replace the claim link</h2>
-    <p>Use this if the link reached the wrong person. The current link stops working at once and every browser has to sign in again with a code.${board.columns.portalLink ? ' The new link is written to the Monday item.' : ''} The claimant is not emailed until you send the new link.</p>
+    <p>Use this if the link reached the wrong person. The current link stops working at once, as does any payment form link already sent, and every browser has to sign in again with a code.${board.columns.portalLink ? ' The new link is written to the Monday item.' : ''} The claimant is not emailed until you send the new link.</p>
     ${confirmBox(`Yes, replace the link for ${c.claimNumber}`)}
     <button class="btn btn-danger" type="submit">Replace the link</button>
   </form>

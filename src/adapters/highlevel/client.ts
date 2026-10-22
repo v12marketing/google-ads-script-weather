@@ -1,5 +1,15 @@
 import type { AppConfig } from '../../config.js';
-import type { ContactInput, HighLevelApi, SendEmailInput, SendSmsInput, SettlementRequest, SignedDocumentCheck } from './types.js';
+import type {
+  ContactIdentity,
+  ContactInput,
+  HighLevelApi,
+  SendEmailInput,
+  SendSmsInput,
+  SentDocument,
+  SettlementDocumentRef,
+  SettlementRequest,
+  SignedDocumentCheck,
+} from './types.js';
 
 // Real HighLevel (LeadConnector) API v2 client, authenticated with a sub-account
 // Private Integration Token. Shapes follow docs/research/highlevel-*.md.
@@ -11,6 +21,15 @@ export const CONVERSATIONS_API_VERSION = '2021-04-15';
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DOCUMENT_PAGE_SIZE = 50;
 const MAX_DOCUMENT_PAGES = 100;
+// Every status GET /proposals/document can filter on ('Declined' is not one).
+const DOCUMENT_STATUSES = 'draft,sent,viewed,completed,accepted';
+// dateFrom/dateTo around the send time. Whether HighLevel filters on createdAt or
+// updatedAt, and at what granularity, is undocumented; a day either side holds
+// the document either way and still keeps the list short.
+const DATE_WINDOW_MARGIN_MS = 24 * 60 * 60 * 1000;
+// A document "sent since" a time may carry a createdAt slightly before it (the two
+// clocks differ). Kept small, so an earlier document is never taken for a new one.
+const SENT_CLOCK_SKEW_MS = 60 * 1000;
 
 // Contact custom fields the integration writes and the settlement template merges
 // ({{contact.claim_number}} etc.). scripts/highlevel-setup.ts creates them as TEXT.
@@ -79,6 +98,7 @@ interface DocumentRecipient {
   hasCompleted?: boolean;
   signedDate?: string | number | null;
   ip?: string | null;
+  shareLink?: string | null;
 }
 
 interface DocumentLink {
@@ -95,7 +115,18 @@ interface DocumentDto {
   status?: string | string[];
   recipients?: DocumentRecipient[];
   links?: DocumentLink[];
+  createdAt?: string;
 }
+
+// The part of a contact (upsert response or GET /contacts/{id}) the integration reads.
+interface ContactDto {
+  id?: string;
+  email?: string | null;
+  emailLowerCase?: string | null;
+  phone?: string | null;
+}
+
+const identityOf = (id: string, c: ContactDto): ContactIdentity => ({ id, email: str(c.email) ?? str(c.emailLowerCase), phone: str(c.phone) });
 
 type Query = Record<string, string | number | undefined>;
 
@@ -105,6 +136,8 @@ export class HighLevelClient implements HighLevelApi {
   private fieldsPromise: Promise<HighLevelCustomField[]> | null = null;
   // Set once HighLevel rejects a message without `status` (see sendMessage).
   private messageStatusRequired = false;
+  // Set once HighLevel rejects dateFrom/dateTo on the document list (see scanDocuments).
+  private dateWindowRejected = false;
 
   constructor(
     readonly config: HighLevelConfig,
@@ -120,7 +153,7 @@ export class HighLevelClient implements HighLevelApi {
 
   // ---- contacts ----
 
-  async upsertContact(input: ContactInput): Promise<string> {
+  async upsertContact(input: ContactInput): Promise<ContactIdentity> {
     const email = input.email?.trim() || null;
     const phone = toE164(input.phone);
     if (!email && !phone) throw new Error('HighLevel upsertContact: the claim has no usable email or phone');
@@ -139,11 +172,27 @@ export class HighLevelClient implements HighLevelApi {
     if (input.customFields && Object.keys(input.customFields).length > 0) {
       body.customFields = await this.customFieldValues(input.customFields);
     }
-    const res = await this.request<{ contact?: { id?: string } }>('POST', '/contacts/upsert', { body });
+    const res = await this.request<{ contact?: ContactDto }>('POST', '/contacts/upsert', { body });
     const id = res.contact?.id;
     if (!id) throw new Error('HighLevel POST /contacts/upsert returned no contact id');
     if (input.tags?.length) await this.addTags(id, input.tags);
-    return id;
+    // The response carries the matched contact's email and phone (it may be a
+    // contact found by phone, with someone else's email). Read the contact back
+    // if a response ever leaves the email out, rather than guess.
+    const c = res.contact!;
+    if (!('email' in c) && !('emailLowerCase' in c)) return (await this.getContact(id)) ?? { id, email: null, phone: str(c.phone) };
+    return identityOf(id, c);
+  }
+
+  async getContact(contactId: string): Promise<ContactIdentity | null> {
+    try {
+      const res = await this.request<{ contact?: ContactDto }>('GET', `/contacts/${seg(contactId)}`);
+      return res.contact ? identityOf(contactId, res.contact) : null;
+    } catch (err) {
+      // Deleted (or never existed): the caller upserts a new one.
+      if (err instanceof HighLevelApiError && (err.status === 404 || (err.status === 400 && /not\s*found/i.test(err.detail)))) return null;
+      throw err;
+    }
   }
 
   async updateContactFields(contactId: string, customFields: Record<string, string>): Promise<void> {
@@ -205,7 +254,9 @@ export class HighLevelClient implements HighLevelApi {
 
   // ---- settlement e-signature ----
 
-  async requestSettlementSignature(req: SettlementRequest): Promise<{ documentId: string | null; referenceId: string | null }> {
+  // Sent once, never retried here: a timeout or 5xx can come after HighLevel has
+  // created and emailed the document, so the caller checks for it first.
+  async requestSettlementSignature(req: SettlementRequest): Promise<SettlementDocumentRef> {
     if (!Number.isFinite(req.settlementAmount) || req.settlementAmount <= 0) {
       throw new Error(`HighLevel settlement for ${req.claimNumber}: invalid settlement amount`);
     }
@@ -260,26 +311,67 @@ export class HighLevelClient implements HighLevelApi {
   // has hasCompleted + a valid signedDate, and this contact is one of them. Staff can
   // "Mark as Completed" in the UI without signatures, so status alone proves nothing.
   async verifySignedDocument(
-    ref: { documentId: string | null; referenceId: string | null },
+    ref: SettlementDocumentRef,
     contactId: string,
+    opts: { sentAt?: string | null } = {},
   ): Promise<SignedDocumentCheck> {
     const ids = new Set([ref.documentId, ref.referenceId].filter((v): v is string => !!v));
     if (ids.size === 0) return notSigned('not_found');
-    // There is no get-by-id and no contact filter, so scan the location's list.
-    const doc =
-      (await this.findDocument(ids, 'completed')) ?? (await this.findDocument(ids, 'draft,sent,viewed,accepted'));
+    // There is no get-by-id and no contact filter, so scan the location's list:
+    // one pass over every status, narrowed to the send date, stopping at the match.
+    const doc = await this.scanDocuments(opts.sentAt ?? null, (d) => documentMatches(d, ids));
     if (!doc) return notSigned('not_found');
     return checkDocument(doc, contactId);
   }
 
-  private async findDocument(ids: Set<string>, status: string): Promise<DocumentDto | null> {
+  async findSentDocuments(contactId: string, since: string, exclude: SettlementDocumentRef[] = []): Promise<SentDocument[]> {
+    const sinceMs = Date.parse(since);
+    if (!Number.isFinite(sinceMs)) throw new Error('HighLevel findSentDocuments: invalid since');
+    const known = new Set(exclude.flatMap((r) => [r.documentId, r.referenceId]).filter((v): v is string => !!v));
+    const found: Array<{ doc: DocumentDto; createdAt: string }> = [];
+    await this.scanDocuments(since, (d) => {
+      if (known.size > 0 && documentMatches(d, known)) return false;
+      if (!(d.recipients ?? []).some((r) => r.id === contactId)) return false;
+      const createdAt = validDate(d.createdAt);
+      if (createdAt && Date.parse(createdAt) >= sinceMs - SENT_CLOCK_SKEW_MS) found.push({ doc: d, createdAt });
+      return false;
+    });
+    return found
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+      .map(({ doc, createdAt }) => {
+        // Keep two of the document's identifiers; either one matches it later.
+        const documentId = str(doc.documentId) ?? str(doc._id);
+        const referenceId = (str(doc.documentId) && str(doc._id)) || str(doc.links?.find((l) => str(l.referenceId))?.referenceId);
+        return { documentId, referenceId, createdAt, signUrl: shareLinkOf(doc, contactId) };
+      });
+  }
+
+  // Pages through GET /proposals/document (every status), within a dateFrom/dateTo
+  // window around `since` when given, until visit() returns true (that document is
+  // returned) or the list ends (null).
+  private async scanDocuments(since: string | null, visit: (d: DocumentDto) => boolean): Promise<DocumentDto | null> {
+    const sinceMs = since ? Date.parse(since) : NaN;
+    const window =
+      Number.isFinite(sinceMs) && !this.dateWindowRejected
+        ? { dateFrom: new Date(sinceMs - DATE_WINDOW_MARGIN_MS).toISOString(), dateTo: new Date(Date.now() + DATE_WINDOW_MARGIN_MS).toISOString() }
+        : {};
     let skip = 0;
     for (let page = 0; page < MAX_DOCUMENT_PAGES; page++) {
-      const res = await this.request<{ documents?: DocumentDto[]; total?: number | string }>('GET', '/proposals/document', {
-        query: { locationId: this.locationId, status, limit: DOCUMENT_PAGE_SIZE, skip },
-      });
+      let res: { documents?: DocumentDto[]; total?: number | string };
+      try {
+        res = await this.request('GET', '/proposals/document', {
+          query: { locationId: this.locationId, status: DOCUMENT_STATUSES, limit: DOCUMENT_PAGE_SIZE, skip, ...window },
+        });
+      } catch (err) {
+        // The dates' format is undocumented. If HighLevel rejects them, scan the
+        // whole list instead, and once that works, stop sending them.
+        if (page > 0 || !('dateFrom' in window) || !(err instanceof HighLevelApiError) || (err.status !== 400 && err.status !== 422)) throw err;
+        const hit = await this.scanDocuments(null, visit);
+        this.dateWindowRejected = true;
+        return hit;
+      }
       const docs = Array.isArray(res.documents) ? res.documents : [];
-      const hit = docs.find((d) => documentMatches(d, ids));
+      const hit = docs.find(visit);
       if (hit) return hit;
       if (docs.length === 0) return null;
       skip += docs.length;
@@ -502,17 +594,30 @@ function validDate(v: unknown): string | null {
   return Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : null;
 }
 
-function notSigned(reason: string, documentName: string | null = null): SignedDocumentCheck {
-  return { signed: false, reason, signedAt: null, signerIp: null, documentName };
+// The contact's own signing link on the document, if HighLevel gives an https one.
+// It lets the claim page link the document; never logged.
+function shareLinkOf(d: DocumentDto, contactId: string): string | null {
+  const link = (Array.isArray(d.recipients) ? d.recipients : []).find((r) => r.id === contactId)?.shareLink;
+  if (typeof link !== 'string' || link.length > 2000) return null;
+  try {
+    return new URL(link).protocol === 'https:' ? link : null;
+  } catch {
+    return null;
+  }
+}
+
+function notSigned(reason: string, documentName: string | null = null, signUrl: string | null = null): SignedDocumentCheck {
+  return { signed: false, reason, signedAt: null, signerIp: null, documentName, signUrl };
 }
 
 function checkDocument(d: DocumentDto, contactId: string): SignedDocumentCheck {
   const name = d.name ?? null;
+  const signUrl = shareLinkOf(d, contactId);
   if (d.deleted) return notSigned('deleted', name);
   if (d.isExpired) return notSigned('expired', name);
   // status is typed as an array in the spec but arrives as a string in examples.
   const statuses = (Array.isArray(d.status) ? d.status : [d.status]).map((s) => String(s ?? '').toLowerCase());
-  if (!statuses.includes('completed')) return notSigned('not_completed', name);
+  if (!statuses.includes('completed')) return notSigned('not_completed', name, signUrl);
   const recipients = Array.isArray(d.recipients) ? d.recipients : [];
   const claimant = recipients.find((r) => r.id === contactId);
   if (!claimant) return notSigned('wrong_signer', name);
@@ -526,5 +631,6 @@ function checkDocument(d: DocumentDto, contactId: string): SignedDocumentCheck {
     signedAt: validDate(claimant.signedDate),
     signerIp: typeof claimant.ip === 'string' && claimant.ip ? claimant.ip : null,
     documentName: name,
+    signUrl,
   };
 }

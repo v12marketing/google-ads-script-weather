@@ -39,9 +39,15 @@ the code follows (what is never logged, what never goes in a text message).
 | `npm run monday:setup -- webhooks` | Register the Monday webhooks (safe to re-run; `--delete` removes them). |
 | `npm run highlevel:setup -- check` | Check the HighLevel token, custom fields, settlement template and user. |
 | `npm run highlevel:setup -- fields` | Create the HighLevel contact custom fields the service uses. |
+| `npm run backup` | Back up `DATA_DIR`: a consistent copy of the database plus the cached files, as one `.tar.gz` in `DATA_DIR/backups` (`-- --out -` writes it to stdout). |
+| `npm run backup -- --check` | Integrity check of the database in `DATA_DIR`, with its claim count and highest claim number. |
+| `npm run backup -- --bump-sequence 1234` | After a restore: the next new claim is numbered above 1234 (never moves the sequence back). |
 
 In the production container there is no `tsx`; the same scripts are compiled:
 `docker compose exec app node dist/scripts/monday-setup.js check` and so on.
+Backups and restores (with `WORKER_ENABLED=false` for a trial restore, so a copy
+never runs queued jobs against the live board) are in
+[docs/SETUP.md](docs/SETUP.md) section 12.
 
 ## Running it locally
 
@@ -83,7 +89,7 @@ src/
                        tokens), job handlers and the job queue
   web/                 Fastify app, routes (public, portal, webhooks, admin),
                        page content, layout, static CSS/JS
-scripts/               setup helpers (Monday, HighLevel, admin password)
+scripts/               setup helpers (Monday, HighLevel, admin password), backup
 config/                board.example.json (copy to board.json)
 deploy/                Dockerfile, docker-compose.yml, Caddyfile
 docs/                  ARCHITECTURE.md, SETUP.md (go-live runbook), research notes
@@ -92,7 +98,8 @@ test/                  vitest suites; helpers.ts builds a full app on fakes
 
 ## Deploying
 
-Production runs with Docker Compose on one server: the app plus Caddy for HTTPS.
+Production runs with Docker Compose on one server: the app plus Caddy for HTTPS,
+request size limits and error pages.
 [docs/SETUP.md](docs/SETUP.md) is the step-by-step runbook: server, DNS, `.env`,
 Monday boards and forms, HighLevel, SMS registration, launch checklist,
 backups and updates.

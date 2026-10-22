@@ -18,6 +18,8 @@
   --bg: #ffffff;
   --bg-soft: #f4f7fa;
   --line: #dbe3ec;
+  /* Form field outlines: 3:1 or better against white and --bg-soft (WCAG 1.4.11). */
+  --field-border: #7a8797;
   --error: #b42318;
   --error-soft: #fdecea;
   --success: #067647;
@@ -92,7 +94,7 @@ h3 { font-size: 1.05rem; margin: 20px 0 6px; }
 .field > span, .field > label { display: block; font-weight: 600; margin-bottom: 6px; }
 input[type="text"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], textarea, select {
   width: 100%; padding: 10px 12px; font: inherit; color: var(--ink);
-  border: 1px solid #b8c4d2; border-radius: 8px; background: #fff; min-height: 44px;
+  border: 1px solid var(--field-border); border-radius: 8px; background: #fff; min-height: 44px;
 }
 textarea { min-height: 120px; resize: vertical; }
 .hint { font-size: 0.875rem; color: var(--ink-soft); margin-top: 4px; }
@@ -158,12 +160,13 @@ input[aria-invalid="true"] { border-color: var(--error); border-width: 2px; }
   .hero-art { display: block; }
 }
 
-/* ---- How it works: three steps ---- */
+/* ---- How it works: three steps ----
+   Scoped to .steps: the claim page's progress tracker also has .step items. */
 .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 16px; }
 @media (min-width: 720px) { .steps { grid-template-columns: repeat(3, 1fr); } }
-.step { position: relative; padding: 20px 18px; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); }
-.step h3 { margin: 14px 0 6px; }
-.step p { margin: 0; color: var(--ink-soft); }
+.steps > .step { position: relative; padding: 20px 18px; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); }
+.steps > .step h3 { margin: 14px 0 6px; }
+.steps > .step p { margin: 0; color: var(--ink-soft); }
 .step-icon {
   display: inline-grid; place-items: center; width: 46px; height: 46px;
   border-radius: 12px; background: var(--accent-soft); color: var(--accent-text);

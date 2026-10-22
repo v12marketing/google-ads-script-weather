@@ -318,6 +318,10 @@ describe('settlement.handleDocumentDeclined', () => {
     const env = makeTestEnv();
     const a = await newClaim(env, { settlement: '500' });
     await env.ctx.services.settlement.sendSettlement(claimOf(env, a.id));
+    // An hour later the claimant declines it: declined documents move to Archived
+    // and drop out of the API's document list.
+    env.ctx.repo.updateClaim(a.id, { settlementSentAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() });
+    env.highlevel.documents.delete(env.ctx.repo.getSettlementRefs(a.id).documentId!);
     const claim = claimOf(env, a.id);
 
     const event = { kind: 'document_declined' as const, contactId: claim.highlevelContactId, claimNumber: claim.claimNumber };

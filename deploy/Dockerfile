@@ -44,7 +44,8 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 # config/board.json is mounted read-only at run time. /data holds the SQLite
-# database and cached claim files, and must be writable by the app user.
+# database and cached claim files, and must be writable by the app user, who
+# also runs the backups (dist/scripts/backup.js, which uses the image's tar).
 RUN mkdir -p /app/config /data && chown node:node /data
 USER node
 VOLUME ["/data"]

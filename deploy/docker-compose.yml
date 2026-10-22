@@ -16,6 +16,9 @@ services:
     image: hdc-app:latest
     restart: unless-stopped
     init: true
+    # On stop (updates, restarts) the app finishes the job in progress, up to
+    # 25 s (STOP_TIMEOUT_MS in src/services/jobs.ts), before Docker kills it.
+    stop_grace_period: 30s
     env_file: ../.env
     # These win over .env, so a value meant for local development can't move the
     # database out of the volume.
@@ -34,7 +37,9 @@ services:
         bind:
           # Fail loudly if board.json is missing instead of mounting an empty directory.
           create_host_path: false
-    # Only Caddy talks to the app; port 3000 is not published on the host.
+    # Only Caddy talks to the app; port 3000 is not published on the host. Keep
+    # it that way: the app takes the client address from X-Forwarded-For, which
+    # only Caddy may set (deploy/Caddyfile).
     expose:
       - "3000"
     logging:
@@ -61,6 +66,18 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+networks:
+  default:
+    # IPv6 inside Docker, so a visitor connecting over IPv6 reaches Caddy with
+    # their own address (Docker NATs it like IPv4). Without it Docker relays IPv6
+    # connections itself and every IPv6 visitor shows up as the network gateway,
+    # sharing one rate limit and admin lockout. Needs Docker Engine 27 or later;
+    # see docs/SETUP.md section 3. The subnet is private (ULA), any /64 will do.
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd8c:4d43:7e5a:1::/64
 
 volumes:
   # Claims database and cached files. Back this up (docs/SETUP.md).

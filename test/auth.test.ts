@@ -93,22 +93,43 @@ describe('auth.sendLoginCode', () => {
     expect(codeRows(env)).toHaveLength(0);
   });
 
-  it('sends at most 3 codes per claim per 15 minutes and 10 per day', async () => {
+  it('sends a browser at most 3 codes per 15 minutes, without locking out the claimant on another browser', async () => {
     const { env, claim, auth, device } = setup();
+    // Someone else with the link asks for codes on their own browser...
     for (let i = 0; i < 3; i++) expect((await auth.sendLoginCode(claim, device)).sent).toBe(true);
-    // The limit is per claim, not per device.
-    expect((await auth.sendLoginCode(claim, auth.newDeviceId())).sent).toBe(false);
+    expect(await auth.sendLoginCode(claim, device)).toEqual({ sent: false, maskedEmail: 'j***@e***.com', limited: 'device' });
     expect(env.highlevel.emails).toHaveLength(3);
+
+    // ...and the claimant still gets a code on theirs, which works there.
+    const mine = auth.newDeviceId();
+    expect(await auth.sendLoginCode(claim, mine)).toEqual({ sent: true, maskedEmail: 'j***@e***.com' });
+    expect(auth.verifyLoginCode(claim, mine, lastCode(env))).toBe('ok');
 
     ageCodes(env, 16 * 60_000);
     expect((await auth.sendLoginCode(claim, device)).sent).toBe(true);
+  });
 
+  it('caps a claim at 20 codes a day across browsers, and tells the team once', async () => {
+    const { env, claim, auth } = setup();
+    env.monday.items.set(claim.itemId, { id: claim.itemId, boardId: env.board.claimsBoardId, name: 'Jane Doe', createdAt: new Date().toISOString(), columnValues: {} });
     const insert = env.ctx.db.prepare(
-      `INSERT INTO login_codes (item_id, device_hash, code_hash, expires_at, created_at) VALUES (?, 'x', 'x', ?, ?)`,
+      `INSERT INTO login_codes (item_id, device_hash, code_hash, expires_at, created_at) VALUES (?, ?, 'x', ?, ?)`,
     );
     const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
-    for (let i = 0; i < 6; i++) insert.run(claim.itemId, hourAgo, hourAgo);
-    expect((await auth.sendLoginCode(claim, device)).sent).toBe(false);
+    for (let i = 0; i < 19; i++) insert.run(claim.itemId, `browser-${i}`, hourAgo, hourAgo);
+    expect((await auth.sendLoginCode(claim, auth.newDeviceId())).sent).toBe(true);
+    expect(await auth.sendLoginCode(claim, auth.newDeviceId())).toEqual({ sent: false, maskedEmail: 'j***@e***.com', limited: 'claim' });
+    await auth.sendLoginCode(claim, auth.newDeviceId());
+    expect(env.highlevel.emails).toHaveLength(1);
+
+    const notes = () => [...env.monday.updates.values()].filter((u) => u.itemId === claim.itemId).map((u) => u.textBody);
+    await vi.waitFor(() => expect(notes()).toHaveLength(1));
+    expect(notes()[0]).toContain('daily maximum of 20 login codes');
+    expect(notes()[0]).toContain('replace the link');
+
+    // A day later the claim can have codes again.
+    ageCodes(env, 24 * 60 * 60_000 + 60_000);
+    expect((await auth.sendLoginCode(claim, auth.newDeviceId())).sent).toBe(true);
   });
 
   it("drops a code whose email failed, so it neither works nor counts", async () => {
@@ -150,12 +171,29 @@ describe('auth.verifyLoginCode', () => {
     const { env, claim, auth, device } = setup();
     await auth.sendLoginCode(claim, device);
     const first = lastCode(env);
-    expect(auth.verifyLoginCode(claim, auth.newDeviceId(), first)).toBe('expired');
+    // Another browser is told the code belongs to the browser that asked for it.
+    expect(auth.verifyLoginCode(claim, auth.newDeviceId(), first)).toBe('other_device');
 
     await auth.sendLoginCode(claim, device);
     const second = lastCode(env);
     if (first !== second) expect(auth.verifyLoginCode(claim, device, first)).toBe('invalid');
     expect(auth.verifyLoginCode(claim, device, second)).toBe('ok');
+  });
+
+  it("says the code was asked for on another browser, rather than 'expired', while that code is live", async () => {
+    const { env, claim, auth, device } = setup();
+    await auth.sendLoginCode(claim, device);
+    const code = lastCode(env);
+    const phone = auth.newDeviceId();
+    expect(auth.verifyLoginCode(claim, phone, code)).toBe('other_device');
+    // The phone's own code expired, but the computer's is live: same answer.
+    await auth.sendLoginCode(claim, phone);
+    env.ctx.db.prepare('UPDATE login_codes SET expires_at = ? WHERE id = (SELECT MAX(id) FROM login_codes)').run(new Date(Date.now() - 1000).toISOString());
+    expect(auth.verifyLoginCode(claim, phone, code)).toBe('other_device');
+    // Asking for nothing more on the phone didn't spend the computer's code.
+    expect(auth.verifyLoginCode(claim, device, code)).toBe('ok');
+    // Once no browser has a live code, it is simply expired.
+    expect(auth.verifyLoginCode(claim, phone, code)).toBe('expired');
   });
 
   it('expires codes after 10 minutes', async () => {

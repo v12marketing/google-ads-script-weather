@@ -2,6 +2,7 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { MondayItem } from '../src/adapters/monday/types.js';
+import { businessDate } from '../src/services/claim-fields.js';
 import { buildApp } from '../src/web/app.js';
 import { DEVICE_COOKIE } from '../src/web/routes/portal.js';
 import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
@@ -256,7 +257,8 @@ describe('end to end: one claim from the form to the payment', () => {
     // Written back to the item.
     const c = env.board.columns;
     expect(column(item, c.claimNumber)).toBe('HDC-000001');
-    expect(column(item, c.dateReceived!)).toBe(claim.receivedAt.slice(0, 10));
+    // The New York date, as the confirmation email and the claim page give it.
+    expect(column(item, c.dateReceived!)).toBe(businessDate(claim.receivedAt));
     portalUrl = new URL(column(item, c.portalLink!)!).pathname;
     expect(portalUrl).toMatch(/^\/c\/[A-Za-z0-9_-]{43}$/);
     token = portalUrl.slice(3);

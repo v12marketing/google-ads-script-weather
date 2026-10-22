@@ -1,11 +1,13 @@
 import type { HighLevelEvent } from '../adapters/highlevel/types.js';
 import type { MondayEvent } from '../adapters/monday/types.js';
+import { visibleFileColumns } from '../board-config.js';
 import { JOB, type AppContext } from './contracts.js';
 
 // Job type -> service call. Payloads are the normalised webhook events (or ids)
 // the routes enqueue.
 export function registerJobHandlers(ctx: AppContext): void {
   const { jobs, services: s } = ctx;
+  const fileColumns = new Set(visibleFileColumns(ctx.board).map((c) => c.columnId));
 
   jobs.register(JOB.mondayItemCreated, (p: { itemId: string }) => s.intake.handleItemCreated(p.itemId));
 
@@ -14,9 +16,10 @@ export function registerJobHandlers(ctx: AppContext): void {
   );
 
   jobs.register(JOB.mondayColumnChanged, async (p: { itemId: string; columnId: string }) => {
-    // File columns re-sync the portal copy; other columns refresh the cached claim.
+    // Every change refreshes the cached claim (an email or phone change also
+    // re-syncs the HighLevel contact); file columns also re-sync the portal copy.
     await s.intake.refreshClaim(p.itemId);
-    await s.files.syncFiles(p.itemId);
+    if (fileColumns.has(p.columnId)) await s.files.syncFiles(p.itemId);
   });
 
   jobs.register(JOB.mondayUpdateCreated, (p: Extract<MondayEvent, { kind: 'update_created' }>) =>

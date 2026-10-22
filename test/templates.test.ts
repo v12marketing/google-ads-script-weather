@@ -90,6 +90,13 @@ describe('default templates', () => {
       if (!t.emailBody) continue;
       if (key === 'claim_links') {
         expect(t.emailBody).toContain('{{claimList}}');
+      } else if (key === 'login_code') {
+        // The code only works in the browser that asked for it, so its email
+        // carries no claim link to open the page somewhere else.
+        expect(t.emailSubject, key).toContain('{{claimNumber}}');
+        expect(t.emailBody, key).not.toContain('{{portalUrl}}');
+        expect(t.emailBody, key).toMatch(/don't share it/);
+        continue;
       } else {
         expect(t.emailSubject, key).toContain('{{claimNumber}}');
         expect(t.emailBody, key).toContain('{{claimNumber}}');
@@ -255,6 +262,7 @@ describe('email rendering', () => {
       subject: 'Claim <HDC-000001> & "you"',
       bodyText: `Hi <script>alert("x")</script> & co,\n\nSee https://example.com/a?b=1&c=2. Thanks\n\nYour claim page:\n${portalUrl}\n\nBad: https://x.test/"onmouseover="alert(1)`,
       claimNumber: 'HDC-000001',
+      linkPrefixes: ['https://claims.test', 'https://example.com/'],
     });
     expect(out.startsWith('<!doctype html>')).toBe(true);
     expect(out).not.toContain('<script>');
@@ -275,10 +283,12 @@ describe('email rendering', () => {
       bodyText: `Pay here:\n${pay}\n\n123456\n\nInline ${portalUrl} link`,
       claimNumber: 'HDC-000001',
       buttons: [{ url: pay, label: 'Choose how to be paid' }],
+      linkPrefixes: ['https://claims.test', 'https://forms.example.test/pay'],
     });
     expect(out).toContain('>Choose how to be paid</a>');
     expect(out).toMatch(/letter-spacing:6px;[^>]*>123456<\/p>/);
     expect(out).not.toContain('View your claim');
+    expect(out).toContain(`Inline <a href="${portalUrl}"`);
   });
 
   it('produces a plain-text version with the same footer', () => {

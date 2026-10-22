@@ -2,10 +2,12 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { statusKeyForLabel } from '../../board-config.js';
 import type { Claim, ClaimFile, ClaimMessage, StatusKey } from '../../domain/types.js';
 import { DEVICE_ID_RE, maskEmail } from '../../services/auth.js';
-import type { AppContext } from '../../services/contracts.js';
+import { BUSINESS_TIME_ZONE } from '../../services/claim-fields.js';
+import type { AppContext, LoginCodeResult } from '../../services/contracts.js';
 import { ClaimantInputError } from '../../services/errors.js';
 import { ALLOWED_UPLOAD_EXTENSIONS } from '../../services/files.js';
 import { MAX_MESSAGE_CHARS } from '../../services/messaging.js';
+import { ContactConflictError } from '../../services/notifier.js';
 import { formatDate, formatMoney } from '../../services/templates.js';
 import { html, raw, textToHtml, type Html } from '../html.js';
 import { page } from '../layout.js';
@@ -27,6 +29,11 @@ const UPLOAD_ACCEPT = [
   ...ALLOWED_UPLOAD_EXTENSIONS.map((e) => `.${e}`),
 ].join(',');
 const MAX_FILES_PER_UPLOAD = 10; // matches the multipart `files` limit in app.ts
+// All the files in one upload together. deploy/Caddyfile lets a little more than
+// this through on /c/*/files, so a larger upload gets our message, not a bare error.
+export const MAX_UPLOAD_REQUEST_BYTES = 100 * 1024 * 1024;
+// Messages a claimant can send from the claim page in any 24 hours.
+export const MAX_PORTAL_MESSAGES_PER_DAY = 50;
 
 const STEPS = ['Received', 'Under review', 'Settlement', 'Payment', 'Closed'] as const;
 // Index into STEPS of the stage each status has reached.
@@ -41,6 +48,22 @@ const STAGE: Record<Exclude<StatusKey, 'denied'>, number> = {
   closed: 4,
 };
 
+// status.ts adds "Status updated: <board label>" to the timeline for each
+// claimant-facing status, which keeps the claim's status history.
+const STATUS_EVENT_PREFIX = 'Status updated: ';
+
+// Shown instead of the settlement_offered text while no document is out for signature.
+const SETTLEMENT_PENDING_TEXT =
+  "We're preparing your settlement offer. We'll email you when the settlement document is ready for you to review and sign.";
+
+type StepState = 'done' | 'current' | 'todo' | 'denied';
+interface TrackerStep {
+  label: string;
+  state: StepState;
+  current?: boolean;
+}
+const STEP_STATE_TEXT: Record<StepState, string> = { done: ' (done)', current: ' (current step)', todo: '', denied: '' };
+
 const FALLBACK_LABELS: Record<StatusKey, string> = {
   received: 'Received',
   under_review: 'Under review',
@@ -54,7 +77,7 @@ const FALLBACK_LABELS: Record<StatusKey, string> = {
 };
 
 const dateTimeFormat = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/New_York',
+  timeZone: BUSINESS_TIME_ZONE,
   month: 'short',
   day: 'numeric',
   year: 'numeric',
@@ -235,41 +258,99 @@ ${csrf}
     return label && statusKeyForLabel(ctx.board, label) === claim.statusKey ? label : FALLBACK_LABELS[claim.statusKey];
   }
 
-  function tracker(claim: Claim): Html {
-    if (claim.statusKey === 'denied') {
-      return html`<ol class="tracker tracker-denied" aria-label="Claim progress">
-<li class="step done"><span class="dot" aria-hidden="true"></span><span class="step-label">Received</span></li>
-<li class="step done"><span class="dot" aria-hidden="true"></span><span class="step-label">Under review</span></li>
-<li class="step denied" aria-current="step"><span class="dot" aria-hidden="true"></span><span class="step-label">Not approved</span></li>
+  // Claimant-facing statuses the claim has had, oldest first, from the timeline.
+  function statusHistory(messages: ClaimMessage[]): StatusKey[] {
+    const keys: StatusKey[] = [];
+    for (const m of messages) {
+      if (m.direction !== 'system' || !m.body.startsWith(STATUS_EVENT_PREFIX)) continue;
+      const key = statusKeyForLabel(ctx.board, m.body.slice(STATUS_EVENT_PREFIX.length));
+      if (key) keys.push(key);
+    }
+    return keys;
+  }
+
+  const trackerList = (steps: TrackerStep[], variant = ''): Html => html`<ol class="tracker${variant ? ` ${variant}` : ''}" aria-label="Claim progress">
+${steps.map(
+  (s) =>
+    html`<li class="step ${s.state}"${s.current ? raw(' aria-current="step"') : ''}><span class="dot" aria-hidden="true"></span><span class="step-label">${s.label}</span>${
+      STEP_STATE_TEXT[s.state] ? html`<span class="visually-hidden">${STEP_STATE_TEXT[s.state]}</span>` : ''
+    }</li>`,
+)}
 </ol>`;
+
+  function tracker(claim: Claim, messages: ClaimMessage[]): Html {
+    const reviewed: TrackerStep[] = [
+      { label: 'Received', state: 'done' },
+      { label: 'Under review', state: 'done' },
+    ];
+    if (claim.statusKey === 'denied') {
+      return trackerList([...reviewed, { label: 'Not approved', state: 'denied', current: true }], 'tracker-denied');
+    }
+    if (claim.statusKey === 'closed') {
+      const history = statusHistory(messages);
+      if (!claim.settlementSignedAt) {
+        // Closed without a settlement (denied, withdrawn, duplicate): no settlement or payment to show.
+        const denied = history.filter((k) => k !== 'closed').at(-1) === 'denied';
+        return trackerList(
+          [...reviewed, ...(denied ? [{ label: 'Not approved', state: 'denied' as const }] : []), { label: 'Closed', state: 'done' }],
+          denied ? 'tracker-denied' : 'tracker-closed',
+        );
+      }
+      const paid = !!claim.paymentDetailsReceivedAt || history.includes('payment_sent');
+      return trackerList([
+        ...reviewed,
+        { label: 'Settlement', state: 'done' },
+        { label: 'Payment', state: paid ? 'done' : 'todo' },
+        { label: 'Closed', state: 'done' },
+      ]);
     }
     let stage = STAGE[claim.statusKey ?? 'received'];
     if (claim.settlementSignedAt) stage = Math.max(stage, STAGE.settlement_signed);
     // Once paid, the payment step is complete rather than in progress.
-    const complete = claim.statusKey === 'payment_sent' || claim.statusKey === 'closed';
-    return html`<ol class="tracker" aria-label="Claim progress">
-${STEPS.map((label, i) => {
-  const state = i < stage || (i === stage && complete) ? 'done' : i === stage ? 'current' : 'todo';
-  return html`<li class="step ${state}"${state === 'current' ? raw(' aria-current="step"') : ''}><span class="dot" aria-hidden="true"></span><span class="step-label">${label}</span><span class="visually-hidden">${state === 'done' ? ' (done)' : state === 'current' ? ' (current step)' : ''}</span></li>`;
-})}
-</ol>`;
+    const complete = claim.statusKey === 'payment_sent';
+    return trackerList(
+      STEPS.map((label, i): TrackerStep => {
+        const state = i < stage || (i === stage && complete) ? 'done' : i === stage ? 'current' : 'todo';
+        return { label, state, current: state === 'current' };
+      }),
+    );
+  }
+
+  // The settlement amount the claimant can act on: a document was sent for it
+  // and isn't signed yet. Null while there is nothing to sign.
+  function settlementOffer(claim: Claim): number | null {
+    if (claim.statusKey !== 'settlement_offered' || !claim.settlementSentAt || claim.settlementSignedAt) return null;
+    const amount = claim.settlementAmountSent ?? claim.settlementAmount;
+    return amount !== null && amount > 0 ? amount : null;
+  }
+
+  // Everything the claim page says about an open settlement offer.
+  function settlementPanel(claim: Claim): Html | null {
+    const amount = settlementOffer(claim);
+    if (amount === null) return null;
+    // The claimant's own signing link from HighLevel, once the integration has it.
+    const signUrl = claim.settlementSignUrl && /^https:\/\//i.test(claim.settlementSignUrl) ? claim.settlementSignUrl : null;
+    return html`<section class="card panel panel-action" aria-labelledby="settlement-title">
+<h2 id="settlement-title">Your settlement offer</h2>
+<p class="amount">${formatMoney(amount)}</p>
+<p>We emailed you the settlement document to sign; it comes from Home Delivery Claims. Please read it and, if you agree, sign it electronically. It only takes a few minutes.</p>
+${signUrl ? html`<p><a class="btn btn-primary" href="${signUrl}" target="_blank" rel="noopener noreferrer">Open the settlement document</a></p>` : ''}
+<p class="small muted">Questions about the offer? Send us a message below before you sign.</p>
+</section>`;
+  }
+
+  // "What happens next" for the claim's status.
+  function nextStepsText(claim: Claim): string {
+    // Settlement offered on the board, but no document is out (amount missing,
+    // sending blocked, or the document was declined or withdrawn).
+    if (claim.statusKey === 'settlement_offered' && !claim.settlementSignedAt && settlementOffer(claim) === null) return SETTLEMENT_PENDING_TEXT;
+    return services.templates.get(claim.statusKey ?? 'received').portalText.trim();
   }
 
   function actionPanels(claim: Claim): Html {
     const panels: Html[] = [];
-    if (claim.statusKey === 'settlement_offered') {
-      const amount = formatMoney(claim.settlementAmountSent ?? claim.settlementAmount);
-      panels.push(html`<section class="card panel panel-action" aria-labelledby="settlement-title">
-<h2 id="settlement-title">Your settlement offer</h2>
-${amount ? html`<p class="amount">${amount}</p>` : ''}
-<p>${
-        claim.settlementSentAt
-          ? 'We emailed you the settlement document to sign; it comes from Home Delivery Claims.'
-          : "We're emailing you the settlement document to sign; it comes from Home Delivery Claims."
-      } Please read it and, if you agree, sign it electronically. It only takes a few minutes.</p>
-<p class="small muted">Questions about the offer? Send us a message below before you sign.</p>
-</section>`);
-    }
+    const settlement = settlementPanel(claim);
+    if (settlement) panels.push(settlement);
 
     const signed = !!claim.settlementSignedAt || claim.statusKey === 'settlement_signed';
     const finished = claim.statusKey === 'payment_sent' || claim.statusKey === 'closed' || claim.statusKey === 'denied';
@@ -306,7 +387,7 @@ ${amount ? html`<p class="amount">${amount}</p>` : ''}
   function claimView(claim: Claim, token: string, deviceId: string, o: ClaimViewOptions = {}): Html {
     const base = `/c/${token}`;
     const csrf = csrfField(deviceId, claim);
-    const portalText = services.templates.get(claim.statusKey ?? 'received').portalText.trim();
+    const portalText = nextStepsText(claim);
     const messages = repo.listMessages(claim.itemId);
     const files = repo.listFiles(claim.itemId);
     const photos = files.filter(isInlineImage);
@@ -316,6 +397,7 @@ ${amount ? html`<p class="amount">${amount}</p>` : ''}
     const badgeClass = claim.statusKey === 'denied' ? 'badge badge-denied' : claim.statusKey === 'closed' || claim.statusKey === 'payment_sent' ? 'badge badge-done' : 'badge';
     const received = formatDate(claim.receivedAt);
     const maxMb = Math.floor(config.MAX_UPLOAD_BYTES / (1024 * 1024));
+    const maxTotalMb = Math.floor(MAX_UPLOAD_REQUEST_BYTES / (1024 * 1024));
 
     return html`<div class="claim-page">
 <header class="claim-head">
@@ -324,7 +406,7 @@ ${amount ? html`<p class="amount">${amount}</p>` : ''}
   <p class="claim-status"><span class="${badgeClass}">${statusText(claim)}</span>${received ? html` <span class="muted small">Filed ${received}</span>` : ''}</p>
 </header>
 ${o.notice ? html`<div class="alert alert-success" role="status">${o.notice}</div>` : ''}
-${tracker(claim)}
+${tracker(claim, messages)}
 ${actionPanels(claim)}
 ${
   portalText
@@ -372,7 +454,7 @@ ${
     : ''
 }
 ${!photos.length && !documents.length ? html`<p class="muted">No photos or documents yet.</p>` : ''}
-<form method="post" action="${base}/files#files" enctype="multipart/form-data" class="upload-form" data-max-bytes="${config.MAX_UPLOAD_BYTES}" data-max-files="${MAX_FILES_PER_UPLOAD}">
+<form method="post" action="${base}/files#files" enctype="multipart/form-data" class="upload-form" data-claim-url="${base}" data-max-bytes="${config.MAX_UPLOAD_BYTES}" data-max-files="${MAX_FILES_PER_UPLOAD}" data-max-total="${MAX_UPLOAD_REQUEST_BYTES}">
 ${csrf}
 ${
   o.uploadErrors?.length
@@ -382,9 +464,9 @@ ${
     : ''
 }
 <label class="field" for="upload"><span>Add photos or documents</span>
-<input type="file" id="upload" name="files" multiple accept="${UPLOAD_ACCEPT}" required${o.uploadErrors?.length ? raw(' aria-describedby="upload-error"') : ''}>
+<input type="file" id="upload" name="files" multiple accept="${UPLOAD_ACCEPT}" required aria-describedby="${o.uploadErrors?.length ? 'upload-error ' : ''}upload-hint">
 </label>
-<p class="hint">Photos, short videos (MP4, MOV), PDFs, or Word and Excel documents, up to ${maxMb} MB each and ${MAX_FILES_PER_UPLOAD} at a time.</p>
+<p class="hint" id="upload-hint">Photos, short videos (MP4, MOV), PDFs, or Word and Excel documents. Up to ${MAX_FILES_PER_UPLOAD} files at a time, ${maxMb} MB each and ${maxTotalMb} MB in total.</p>
 <p class="file-summary" data-file-summary aria-live="polite" hidden></p>
 <button type="submit" class="btn btn-secondary" data-busy-label="Uploading…">Upload</button>
 </form>
@@ -503,25 +585,28 @@ ${
         if (!auth.checkCsrf(deviceId, claim.itemId, field(req.body, '_csrf'))) return formExpired(reply, token);
         if (auth.isDeviceTrusted(claim, deviceId)) return redirect(reply, `/c/${token}`);
         if (!claim.email) return sendHtml(reply, 200, 'Open your claim', verifyView(claim, token, deviceId, 'start'));
-        let sent: boolean;
+        let result: LoginCodeResult;
         try {
-          ({ sent } = await auth.sendLoginCode(claim, deviceId));
-        } catch {
-          return sendHtml(
-            reply,
-            503,
-            'Open your claim',
-            verifyView(claim, token, deviceId, 'start', { kind: 'error', text: "We couldn't send the email just now. Please try again in a few minutes." }),
-          );
+          result = await auth.sendLoginCode(claim, deviceId);
+        } catch (err) {
+          // The claim's contact details need the team's attention (they've been told).
+          const text =
+            err instanceof ContactConflictError
+              ? "We can't email a code for this claim just now. Our claims team has been told and will be in touch. You can also reply to any email or text message you've had from us."
+              : "We couldn't send the email just now. Please try again in a few minutes.";
+          return sendHtml(reply, 503, 'Open your claim', verifyView(claim, token, deviceId, 'start', { kind: 'error', text }));
         }
-        if (sent) return redirect(reply, `/c/${token}?code=sent`);
+        if (result.sent) return redirect(reply, `/c/${token}?code=sent`);
         return sendHtml(
           reply,
           429,
           'Enter your code',
           verifyView(claim, token, deviceId, 'code', {
             kind: 'error',
-            text: "You've asked for several codes in a short time. Please use the most recent code we emailed you, or wait 15 minutes and ask for a new one.",
+            text:
+              result.limited === 'claim'
+                ? "We've emailed as many sign-in codes for this claim as we can today. Please try again tomorrow, or reply to any email or text message you've had from us and our claims team will help."
+                : "You've asked for several codes on this device in a short time. Please use the most recent code you asked for here, or wait 15 minutes and ask for a new one.",
           }),
         );
       });
@@ -546,9 +631,11 @@ ${
           );
         }
         const text =
-          result === 'expired'
-            ? 'That code has expired or been replaced by a newer one. Please use the latest code we sent, or ask for a new one.'
-            : "That code isn't right. Please check the email and try again.";
+          result === 'other_device'
+            ? 'That code was asked for on a different browser or device, and only works there. Enter it there, or ask for a new code here.'
+            : result === 'expired'
+              ? 'That code has expired or been replaced by a newer one. Please use the latest code we sent, or ask for a new one.'
+              : "That code isn't right. Please check the email and try again.";
         return sendHtml(reply, 400, 'Enter your code', verifyView(claim, token, deviceId, 'code', { kind: 'error', text }));
       });
 
@@ -560,6 +647,12 @@ ${
         if (!auth.checkCsrf(deviceId, claim.itemId, field(req.body, '_csrf'))) return formExpired(reply, token);
         const text = field(req.body, 'message') ?? '';
         try {
+          const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+          if (repo.countMessagesSince(claim.itemId, 'from_claimant', 'portal', since) >= MAX_PORTAL_MESSAGES_PER_DAY) {
+            throw new ClaimantInputError(
+              "You've sent us a lot of messages today, so we can't take more from this page just now. We'll read everything you've sent. Please try again tomorrow, or reply to one of our emails if it's urgent.",
+            );
+          }
           services.messaging.postFromPortal(claim, text);
         } catch (err) {
           if (!(err instanceof ClaimantInputError)) throw err;
@@ -573,7 +666,8 @@ ${
         return redirect(reply, `/c/${token}?sent=1#messages`);
       });
 
-      portal.post<TokenParams>('/c/:token/files', { config: { rateLimit: { max: 30, timeWindow: '15 minutes' } } }, async (req, reply) => {
+      // With JavaScript, the page sends one request per file, hence the higher limit.
+      portal.post<TokenParams>('/c/:token/files', { config: { rateLimit: { max: 60, timeWindow: '15 minutes' } } }, async (req, reply) => {
         const r = resolvePost(req, reply);
         if (!r) return reply;
         const { claim, token, deviceId } = r;
@@ -581,10 +675,14 @@ ${
         if (!req.isMultipart()) return formExpired(reply, token);
 
         const maxMb = Math.floor(config.MAX_UPLOAD_BYTES / (1024 * 1024));
+        const maxTotalMb = Math.floor(MAX_UPLOAD_REQUEST_BYTES / (1024 * 1024));
+        // portal.js uploads one file per request and reads the outcome as JSON.
+        const wantsJson = /\bapplication\/json\b/.test(String(req.headers.accept ?? ''));
         const errors: Array<{ name: string | null; message: string }> = [];
         let csrfOk = false;
         let added = 0;
         let chosen = 0;
+        let total = 0;
         try {
           for await (const part of req.parts()) {
             if (part.type === 'field') {
@@ -610,9 +708,15 @@ ${
               errors.push({ name, message: `This file is larger than ${maxMb} MB.` });
               continue;
             }
+            // Each file that would take the upload over its total is named, never dropped silently.
+            if (total + data.length > MAX_UPLOAD_REQUEST_BYTES) {
+              errors.push({ name, message: `One upload can be up to ${maxTotalMb} MB in total, so this file wasn't added. Please upload it again on its own.` });
+              continue;
+            }
             try {
               await services.files.addClaimantUpload(claim, { name: part.filename, mimeType: part.mimetype, data });
               added++;
+              total += data.length;
             } catch (err) {
               if (!(err instanceof ClaimantInputError)) throw err;
               errors.push({ name, message: err.message });
@@ -621,11 +725,16 @@ ${
         } catch (err) {
           const code = errorCode(err);
           // A too-large file was already reported where it was read; the parser re-raises it at the end.
-          if (code === 'FST_FILES_LIMIT') errors.push({ name: null, message: `Please add up to ${MAX_FILES_PER_UPLOAD} files at a time.` });
-          else if (code !== 'FST_REQ_FILE_TOO_LARGE') throw err;
+          if (code === 'FST_FILES_LIMIT') {
+            errors.push({
+              name: null,
+              message: `Please add up to ${MAX_FILES_PER_UPLOAD} files at a time. Files after the first ${MAX_FILES_PER_UPLOAD} weren't added; please upload them separately.`,
+            });
+          } else if (code !== 'FST_REQ_FILE_TOO_LARGE') throw err;
         }
         if (!csrfOk) return formExpired(reply, token);
         if (!chosen && !errors.length) errors.push({ name: null, message: 'Please choose at least one photo or document to upload.' });
+        if (wantsJson) return reply.code(added || !errors.length ? 200 : 400).send({ added, errors });
         if (!errors.length) return redirect(reply, `/c/${token}?uploaded=${added}#files`);
         const fresh = repo.getClaim(claim.itemId) ?? claim;
         return sendHtml(

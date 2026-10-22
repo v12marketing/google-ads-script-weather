@@ -1,10 +1,12 @@
 import type { FastifyInstance } from 'fastify';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NewClaim } from '../src/db/repo.js';
 import { JOB } from '../src/services/contracts.js';
 import { buildApp } from '../src/web/app.js';
-import { contentDisposition, DEVICE_COOKIE } from '../src/web/routes/portal.js';
-import { makeTestEnv, type TestEnv } from './helpers.js';
+import { MAX_CLAIMANT_FILES_PER_CLAIM } from '../src/services/files.js';
+import { ContactConflictError } from '../src/services/notifier.js';
+import { contentDisposition, DEVICE_COOKIE, MAX_PORTAL_MESSAGES_PER_DAY, MAX_UPLOAD_REQUEST_BYTES } from '../src/web/routes/portal.js';
+import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
 
 let nextItem = 7000;
 const apps: FastifyInstance[] = [];
@@ -105,6 +107,10 @@ async function verifyDevice(t: Setup): Promise<{ cookie: string; csrf: string }>
   const page = await get(t, t.url, cookie);
   return { cookie, csrf: csrfFrom(page.body) };
 }
+
+// The progress tracker's steps as [label, state].
+const trackerSteps = (body: string): string[][] =>
+  [...body.matchAll(/<li class="step (\w+)"[^>]*><span class="dot" aria-hidden="true"><\/span><span class="step-label">([^<]+)<\/span>/g)].map((m) => [m[2]!, m[1]!]);
 
 function addFile(t: Setup, o: { itemId?: string; name: string; mimeType: string; data: Buffer; source?: 'team' | 'claimant' }) {
   const storageKey = `${o.itemId ?? t.claim.itemId}/test-${Math.random().toString(16).slice(2)}`;
@@ -240,6 +246,53 @@ describe('portal: link and device verification', () => {
     expect(ipLimited.headers['cache-control']).toBe('no-store');
   });
 
+  it("says when the claim's daily code allowance is used up, instead of pointing to a code this browser never got", async () => {
+    const t = await setup();
+    const insert = t.env.ctx.db.prepare(`INSERT INTO login_codes (item_id, device_hash, code_hash, expires_at, created_at) VALUES (?, ?, 'x', ?, ?)`);
+    const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+    for (let i = 0; i < 20; i++) insert.run(t.claim.itemId, `other-browser-${i}`, hourAgo, hourAgo);
+    const first = await get(t, t.url);
+    const res = await post(t, `${t.url}/code`, deviceCookie(first)!.value, form({ _csrf: csrfFrom(first.body) }));
+    expect(res.statusCode).toBe(429);
+    expect(res.body).toContain('as many sign-in codes for this claim as we can today');
+    expect(res.body).not.toContain('most recent code');
+    expect(t.env.highlevel.emails).toHaveLength(0);
+  });
+
+  it('points a browser that hit its own limit to the code it asked for here', async () => {
+    const t = await setup();
+    const first = await get(t, t.url);
+    const cookie = deviceCookie(first)!.value;
+    const csrf = csrfFrom(first.body);
+    for (let i = 0; i < 3; i++) await post(t, `${t.url}/code`, cookie, form({ _csrf: csrf }));
+    const res = await post(t, `${t.url}/code`, cookie, form({ _csrf: csrf }));
+    expect(res.statusCode).toBe(429);
+    expect(res.body).toContain('most recent code you asked for here');
+  });
+
+  it("explains that a code can't be emailed while the claim's contact needs the team", async () => {
+    const t = await setup();
+    vi.spyOn(t.env.ctx.services.auth, 'sendLoginCode').mockRejectedValueOnce(new ContactConflictError('conflict'));
+    const first = await get(t, t.url);
+    const res = await post(t, `${t.url}/code`, deviceCookie(first)!.value, form({ _csrf: csrfFrom(first.body) }));
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toContain('can&#39;t email a code for this claim just now');
+    expect(res.body).not.toContain('try again in a few minutes');
+  });
+
+  it('tells a browser that a code was asked for on another one', async () => {
+    const t = await setup();
+    const computer = await get(t, t.url);
+    await post(t, `${t.url}/code`, deviceCookie(computer)!.value, form({ _csrf: csrfFrom(computer.body) }));
+    const code = lastCode(t.env);
+    // The claimant opens the claim on their phone and types the code there.
+    const phone = await get(t, `${t.url}?code=enter`);
+    const res = await post(t, `${t.url}/verify`, deviceCookie(phone)!.value, form({ _csrf: csrfFrom(phone.body), code }));
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain('asked for on a different browser or device');
+    expect(res.body).not.toContain('expired');
+  });
+
   it('rejects code requests without a valid CSRF token or device cookie', async () => {
     const t = await setup();
     const first = await get(t, t.url);
@@ -323,6 +376,24 @@ describe('portal: claim page', () => {
     expect(body).not.toContain('$1,500.00');
     expect(body).toContain('it comes from Home Delivery Claims');
     expect(body).not.toContain('secure payment form');
+    // No signing link from HighLevel yet: no button, and no promise of one.
+    expect(body).not.toContain('Open the settlement document');
+    expect(body).not.toContain('open it from this page');
+  });
+
+  it("links the claimant's settlement document once HighLevel has given its signing link", async () => {
+    const t = await setup({ statusKey: 'settlement_offered', statusLabel: 'Settlement offered' });
+    const link = 'https://link.example.com/documents/v1/abc?x=1&y=2';
+    t.env.ctx.repo.updateClaim(t.claim.itemId, { settlementAmountSent: 900, settlementSentAt: new Date().toISOString(), settlementSignUrl: link });
+    const { cookie } = await verifyDevice(t);
+    const body = (await get(t, t.url, cookie)).body;
+    expect(body).toContain(
+      '<a class="btn btn-primary" href="https://link.example.com/documents/v1/abc?x=1&amp;y=2" target="_blank" rel="noopener noreferrer">Open the settlement document</a>',
+    );
+
+    // Signed, or no longer open: no link.
+    t.env.ctx.repo.updateClaim(t.claim.itemId, { settlementSentAt: null });
+    expect((await get(t, t.url, cookie)).body).not.toContain('Open the settlement document');
   });
 
   it('links the payment form after signing, then shows payment details received', async () => {
@@ -349,6 +420,97 @@ describe('portal: claim page', () => {
     expect(body).toContain('tracker-denied');
     expect(body).toContain('badge badge-denied');
     expect(body).not.toContain('>Settlement<');
+  });
+
+  it('never shows settlement or payment as done on a claim closed without a settlement', async () => {
+    const t = await setup({ statusKey: 'closed', statusLabel: 'Closed' });
+    const { cookie } = await verifyDevice(t);
+    const body = (await get(t, t.url, cookie)).body;
+    expect(trackerSteps(body)).toEqual([
+      ['Received', 'done'],
+      ['Under review', 'done'],
+      ['Closed', 'done'],
+    ]);
+    expect(body).not.toContain('>Settlement<');
+    expect(body).not.toContain('>Payment<');
+  });
+
+  it('shows a claim that was denied and then closed as not approved', async () => {
+    const env = makeTestEnv();
+    const item = addClaimItem(env);
+    await env.ctx.services.intake.handleItemCreated(item.id);
+    for (const [label, eventId] of [['Denied', 'evt-1'], ['Closed', 'evt-2']] as const) {
+      env.monday.setText(item.id, env.board.columns.status, label, 'status');
+      await env.ctx.services.status.handleStatusChanged(item.id, label, eventId);
+    }
+    const claim = env.ctx.repo.getClaim(item.id)!;
+    expect(claim.statusKey).toBe('closed');
+    const app = await buildApp(env.ctx);
+    apps.push(app);
+    const token = env.ctx.services.tokens.portalToken(claim.itemId, claim.tokenVersion);
+    const t: Setup = { env, app, claim, token, url: `/c/${token}` };
+    const { cookie } = await verifyDevice(t);
+
+    const body = (await get(t, t.url, cookie)).body;
+    expect(trackerSteps(body)).toEqual([
+      ['Received', 'done'],
+      ['Under review', 'done'],
+      ['Not approved', 'denied'],
+      ['Closed', 'done'],
+    ]);
+    expect(body).toContain('tracker-denied');
+  });
+
+  it('shows settlement and payment done on a claim closed after it was settled and paid', async () => {
+    const t = await setup({ statusKey: 'closed', statusLabel: 'Closed' });
+    const { repo } = t.env.ctx;
+    repo.updateClaim(t.claim.itemId, { settlementSignedAt: new Date().toISOString() });
+    const { cookie } = await verifyDevice(t);
+    // Signed, but no sign of payment (no payment details, never "Payment sent").
+    expect(trackerSteps((await get(t, t.url, cookie)).body)).toEqual([
+      ['Received', 'done'],
+      ['Under review', 'done'],
+      ['Settlement', 'done'],
+      ['Payment', 'todo'],
+      ['Closed', 'done'],
+    ]);
+
+    repo.addMessage({ itemId: t.claim.itemId, direction: 'system', channel: 'monday', body: 'Status updated: Payment sent' });
+    repo.addMessage({ itemId: t.claim.itemId, direction: 'system', channel: 'monday', body: 'Status updated: Closed' });
+    const paid = trackerSteps((await get(t, t.url, cookie)).body);
+    expect(paid.map(([, state]) => state)).toEqual(['done', 'done', 'done', 'done', 'done']);
+  });
+
+  it('shows the settlement offer only once a document for a real amount has been sent', async () => {
+    const t = await setup({ statusKey: 'settlement_offered', statusLabel: 'Settlement offered' });
+    const { repo } = t.env.ctx;
+    const offeredText = 'sent you a settlement offer to review';
+    repo.updateClaim(t.claim.itemId, { settlementAmount: 0 });
+    const { cookie } = await verifyDevice(t);
+
+    // No document went out: the amount was 0, or sending was blocked.
+    for (const amount of [0, 2000]) {
+      repo.updateClaim(t.claim.itemId, { settlementAmount: amount });
+      const body = (await get(t, t.url, cookie)).body;
+      expect(body).toContain('>Settlement offered<');
+      expect(body).not.toContain('Your settlement offer');
+      expect(body).not.toContain('$0.00');
+      expect(body).not.toContain('$2,000.00');
+      expect(body).not.toContain(offeredText);
+      expect(body).toContain('preparing your settlement offer');
+    }
+
+    repo.updateClaim(t.claim.itemId, { settlementSentAt: new Date().toISOString(), settlementAmountSent: 2000 });
+    const sent = (await get(t, t.url, cookie)).body;
+    expect(sent).toContain('Your settlement offer');
+    expect(sent).toContain('$2,000.00');
+    expect(sent).toContain(offeredText);
+
+    // The document was declined or withdrawn in HighLevel.
+    repo.updateClaim(t.claim.itemId, { settlementSentAt: null });
+    const withdrawn = (await get(t, t.url, cookie)).body;
+    expect(withdrawn).not.toContain('Your settlement offer');
+    expect(withdrawn).toContain('preparing your settlement offer');
   });
 });
 
@@ -383,6 +545,27 @@ describe('portal: messages', () => {
     const tooLong = await post(t, `${t.url}/messages`, cookie, form({ _csrf: csrf, message: long }));
     expect(tooLong.statusCode).toBe(400);
     expect(tooLong.body).toContain(long);
+  });
+
+  it('limits the messages one claim can send from the page in a day', async () => {
+    const t = await setup();
+    const { repo, jobs } = t.env.ctx;
+    const itemId = t.claim.itemId;
+    const yesterday = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    for (let i = 0; i < MAX_PORTAL_MESSAGES_PER_DAY; i++) {
+      repo.addMessage({ itemId, direction: 'from_claimant', channel: 'portal', body: `old ${i}`, createdAt: yesterday });
+    }
+    for (let i = 0; i < MAX_PORTAL_MESSAGES_PER_DAY - 1; i++) repo.addMessage({ itemId, direction: 'from_claimant', channel: 'portal', body: `today ${i}` });
+    repo.addMessage({ itemId, direction: 'from_claimant', channel: 'email', body: 'An email reply' }); // not from the page
+    const { cookie, csrf } = await verifyDevice(t);
+
+    expect((await post(t, `${t.url}/messages`, cookie, form({ _csrf: csrf, message: 'The last one for today' }))).statusCode).toBe(303);
+    const res = await post(t, `${t.url}/messages`, cookie, form({ _csrf: csrf, message: 'One more thing' }));
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain('a lot of messages today');
+    expect(res.body).toContain('>One more thing</textarea>');
+    expect(repo.listMessages(itemId).filter((m) => m.body === 'One more thing')).toEqual([]);
+    expect(jobs.list().filter((j) => j.type === JOB.portalMessageToMonday)).toHaveLength(1);
   });
 
   it('rejects a bad CSRF token and untrusted devices', async () => {
@@ -475,6 +658,69 @@ describe('portal: files', () => {
     const tooMany = await post(t, `${t.url}/files`, cookie, multipart([{ name: '_csrf', value: csrf }, ...many]));
     expect(tooMany.body).toContain('Please add up to 10 files at a time');
     expect(t.env.ctx.repo.listFiles(t.claim.itemId)).toHaveLength(11);
+  });
+
+  it('states the upload limits on the form', async () => {
+    const t = await setup();
+    const { cookie } = await verifyDevice(t);
+    const body = (await get(t, t.url, cookie)).body;
+    expect(body).toContain('Up to 10 files at a time, 25 MB each and 100 MB in total.');
+    expect(body).toContain(`data-claim-url="${t.url}" data-max-bytes="${25 * 1024 * 1024}" data-max-files="10" data-max-total="${MAX_UPLOAD_REQUEST_BYTES}"`);
+    expect(body).toContain('aria-describedby="upload-hint"');
+  });
+
+  it('names each file that would take one upload over its total, and keeps the rest', async () => {
+    const t = await setup();
+    const { cookie, csrf } = await verifyDevice(t);
+    const photo = Buffer.concat([PNG, Buffer.alloc(21 * 1024 * 1024)]); // under 25 MB each; five are over 100 MB
+    const res = await post(
+      t,
+      `${t.url}/files`,
+      cookie,
+      multipart([
+        { name: '_csrf', value: csrf },
+        ...[1, 2, 3, 4, 5].map((i) => ({ name: 'files', filename: `photo${i}.png`, type: 'image/png', data: photo })),
+        { name: 'files', filename: 'receipt.pdf', type: 'application/pdf', data: PDF },
+      ]),
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('5 files were added');
+    expect(res.body).toContain('<strong>photo5.png</strong>: One upload can be up to 100 MB in total');
+    expect(t.env.ctx.repo.listFiles(t.claim.itemId).map((f) => f.name)).toEqual(['photo1.png', 'photo2.png', 'photo3.png', 'photo4.png', 'receipt.pdf']);
+  });
+
+  it("answers the page script's one-file uploads with JSON", async () => {
+    const t = await setup();
+    const { cookie, csrf } = await verifyDevice(t);
+    const send = (file: { filename: string; type: string; data: Buffer }) => {
+      const body = multipart([{ name: '_csrf', value: csrf }, { name: 'files', ...file }]);
+      return t.app.inject({
+        method: 'POST',
+        url: `${t.url}/files`,
+        cookies: { [DEVICE_COOKIE]: cookie },
+        headers: { ...body.headers, accept: 'application/json' },
+        payload: body.payload,
+      });
+    };
+
+    const ok = await send({ filename: 'box.png', type: 'image/png', data: PNG });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toEqual({ added: 1, errors: [] });
+
+    const bad = await send({ filename: 'evil.html', type: 'text/html', data: Buffer.from('<script>alert(1)</script>') });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json()).toEqual({ added: 0, errors: [{ name: 'evil.html', message: expect.stringContaining("can't accept that type of file") }] });
+    expect(t.env.ctx.repo.listFiles(t.claim.itemId).map((f) => f.name)).toEqual(['box.png']);
+  });
+
+  it("refuses files over the claim's allowance with a friendly message", async () => {
+    const t = await setup();
+    for (let i = 0; i < MAX_CLAIMANT_FILES_PER_CLAIM; i++) addFile(t, { name: `p${i}.png`, mimeType: 'image/png', data: PNG, source: 'claimant' });
+    const { cookie, csrf } = await verifyDevice(t);
+    const res = await post(t, `${t.url}/files`, cookie, multipart([{ name: '_csrf', value: csrf }, { name: 'files', filename: 'box.png', type: 'image/png', data: PNG }]));
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain(`<strong>box.png</strong>: Your claim already has ${MAX_CLAIMANT_FILES_PER_CLAIM} files from you`);
+    expect(t.env.ctx.repo.listFiles(t.claim.itemId)).toHaveLength(MAX_CLAIMANT_FILES_PER_CLAIM);
   });
 
   it('refuses uploads without CSRF or from an untrusted device', async () => {

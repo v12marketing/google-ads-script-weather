@@ -17,6 +17,10 @@ export { ClaimantInputError } from './errors.js';
 
 // Team files larger than this are not mirrored.
 export const MAX_SYNC_BYTES = 100 * 1024 * 1024;
+// Per-claim allowance for files from the claimant, so one claim can't fill the
+// disk (shared with the database) or flood Monday and the team's notifications.
+export const MAX_CLAIMANT_FILES_PER_CLAIM = 100;
+export const MAX_CLAIMANT_BYTES_PER_CLAIM = 500 * 1024 * 1024;
 const ASSET_BATCH = 50;
 const MAX_NAME_CHARS = 100;
 
@@ -144,6 +148,15 @@ const formatMb = (bytes: number): string => String(Number((bytes / (1024 * 1024)
 
 const ASSET_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+// Recorded just before a claimant upload is sent to Monday. /v2/file can fail
+// (5xx, timeout) after the file has landed, so once this is set the asset may
+// already be in the claimant-uploads column.
+const uploadAttemptKey = (fileId: number): string => `claimant-upload:${fileId}:attempted`;
+
+// Whether a Monday asset is the copy of this claimant upload: same name and size.
+const isCopyOf = (meta: MondayAsset | undefined, f: ClaimFile): boolean =>
+  !!meta && meta.fileSize === f.sizeBytes && safeFileName(meta.name ?? '') === f.name;
+
 export function createFileService(ctx: CoreContext, _services: Services): FileService {
   const { board, config, db, repo, jobs, monday, store, log } = ctx;
 
@@ -229,17 +242,61 @@ export function createFileService(ctx: CoreContext, _services: Services): FileSe
     const missing = [...current.keys()].filter((a) => !known.has(a));
     if (!missing.length) return;
     const meta = await assetMeta(missing);
+    // Claimant uploads sent to Monday but not yet linked to their asset (the
+    // attach failed ambiguously, or is still finishing). Their copy in the
+    // claimant-uploads column is linked by attachUploadToMonday, not mirrored again.
+    const unlinked = repo
+      .listFiles(itemId)
+      .filter((f) => f.source === 'claimant' && !f.mondayAssetId && repo.isEventProcessed(uploadAttemptKey(f.id)));
     // One failed download shouldn't hold up the rest; the job retries the remainder.
     let failure: unknown = null;
     for (const assetId of missing) {
+      const col = current.get(assetId)!;
+      if (col.columnId === board.columns.claimantUploads) {
+        const i = unlinked.findIndex((f) => isCopyOf(meta.get(assetId), f));
+        if (i >= 0) {
+          log.info({ itemId, assetId, fileId: unlinked[i]!.id }, 'files: asset is a claimant upload still being attached, not mirrored');
+          unlinked.splice(i, 1);
+          continue;
+        }
+      }
       try {
-        await mirror(itemId, assetId, current.get(assetId)!, meta.get(assetId));
+        await mirror(itemId, assetId, col, meta.get(assetId));
       } catch (err) {
         failure ??= err;
         log.warn({ itemId, assetId }, 'files: download failed, will retry');
       }
     }
     if (failure) throw failure;
+  }
+
+  // Throws when one more file of this size would take the claim over its allowance.
+  function checkAllowance(itemId: string, size: number): void {
+    const { count, bytes } = repo.claimantFileTotals(itemId);
+    if (count >= MAX_CLAIMANT_FILES_PER_CLAIM || bytes + size > MAX_CLAIMANT_BYTES_PER_CLAIM) {
+      log.warn({ itemId, count, sizeBytes: bytes }, 'files: claimant upload refused, claim is at its upload allowance');
+    }
+    if (count >= MAX_CLAIMANT_FILES_PER_CLAIM) {
+      throw new ClaimantInputError(
+        `Your claim already has ${MAX_CLAIMANT_FILES_PER_CLAIM} files from you, which is the most we can take on the claim page. If you need to send us more, please send us a message and we'll help.`,
+      );
+    }
+    if (bytes + size > MAX_CLAIMANT_BYTES_PER_CLAIM) {
+      throw new ClaimantInputError(
+        `This file would take the files you've added to your claim over ${formatMb(MAX_CLAIMANT_BYTES_PER_CLAIM)} MB in total, which is the most we can take on the claim page. If you need to send us more, please send us a message and we'll help.`,
+      );
+    }
+  }
+
+  // The asset an earlier, failed attempt left in the column, if it landed after
+  // all: same name and size, and not already the copy of another cached file.
+  async function landedUpload(f: ClaimFile, columnId: string): Promise<string | null> {
+    const item = await monday.getItem(f.itemId, [columnId]);
+    const linked = new Set(repo.listFiles(f.itemId).map((x) => x.mondayAssetId));
+    const candidates = (item?.columnValues[columnId]?.assetIds ?? []).map(String).filter((a) => ASSET_ID_RE.test(a) && !linked.has(a));
+    if (!candidates.length) return null;
+    const meta = await assetMeta(candidates);
+    return candidates.find((a) => isCopyOf(meta.get(a), f)) ?? null;
   }
 
   async function addClaimantUpload(claim: Claim, file: { name: string; mimeType: string; data: Buffer }): Promise<ClaimFile> {
@@ -266,10 +323,14 @@ export function createFileService(ctx: CoreContext, _services: Services): FileSe
       );
     }
 
+    checkAllowance(claim.itemId, data.length);
+
     const storageKey = `${claim.itemId}/u-${randomBytes(8).toString('hex')}-${name}`;
     await store.put(storageKey, data);
     try {
       const f = db.transaction(() => {
+        // Again, atomically with the insert: another upload may have finished meanwhile.
+        checkAllowance(claim.itemId, data.length);
         const added = repo.addFile({
           itemId: claim.itemId,
           source: 'claimant',
@@ -302,22 +363,32 @@ export function createFileService(ctx: CoreContext, _services: Services): FileSe
     if (!claim) throw new PermanentJobError(`No claim for file ${fileId}`);
 
     if (!f.mondayAssetId) {
-      let data: Buffer;
-      try {
-        data = await store.get(f.storageKey);
-      } catch {
-        throw new PermanentJobError(`Upload ${fileId} is missing from the file store`);
-      }
       const columnId = board.columns.claimantUploads;
-      const assetId = await monday.uploadFileToColumn(f.itemId, columnId, { name: f.name, mimeType: f.mimeType, data });
-      // Recorded before the column-change webhook's sync can run, so it isn't mirrored twice.
-      repo.setFileMondayAsset(f.id, columnId, String(assetId));
-      log.info({ itemId: f.itemId, fileId, assetId }, 'files: claimant upload attached to Monday');
+      const attemptKey = uploadAttemptKey(f.id);
+      // A retry: the last attempt may have landed even though it failed. Link
+      // that asset rather than put a second copy on the item.
+      const landed = repo.isEventProcessed(attemptKey) ? await landedUpload(f, columnId) : null;
+      if (landed) {
+        repo.setFileMondayAsset(f.id, columnId, landed);
+        log.info({ itemId: f.itemId, fileId, assetId: landed }, 'files: earlier attempt had attached the claimant upload; linked it');
+      } else {
+        let data: Buffer;
+        try {
+          data = await store.get(f.storageKey);
+        } catch {
+          throw new PermanentJobError(`Upload ${fileId} is missing from the file store`);
+        }
+        repo.markEventProcessed(attemptKey);
+        const assetId = await monday.uploadFileToColumn(f.itemId, columnId, { name: f.name, mimeType: f.mimeType, data });
+        // Recorded as soon as we know it; until then syncFiles leaves a matching asset alone.
+        repo.setFileMondayAsset(f.id, columnId, String(assetId));
+        log.info({ itemId: f.itemId, fileId, assetId }, 'files: claimant upload attached to Monday');
+      }
     }
 
     const key = `claimant-upload:${f.id}`;
-    await onceFor(ctx, `${key}:update`, () =>
-      monday.createUpdate(f.itemId, `<p>Claimant added ${escapeHtml(f.name)} on the claim page.</p>`),
+    await onceFor(ctx, `${key}:update`, (once) =>
+      monday.createUpdate(f.itemId, `<p>Claimant added ${escapeHtml(f.name)} on the claim page.</p>`, once),
     );
     await notifyTeam(ctx, claim, key, `${claim.claimNumber}: new file from the claimant`);
   }

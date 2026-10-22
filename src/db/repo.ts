@@ -36,6 +36,11 @@ interface ClaimRow {
   settlement_reference_id: string | null;
   settlement_amount_sent: number | null;
   settlement_signed_at: string | null;
+  settlement_attempt_at: string | null;
+  settlement_attempt_amount: number | null;
+  settlement_seen_at: string | null;
+  settlement_checked_at: string | null;
+  settlement_sign_url: string | null;
   payment_details_received_at: string | null;
   received_at: string;
   updated_at: string;
@@ -59,6 +64,10 @@ const toClaim = (r: ClaimRow): Claim => ({
   settlementSentAt: r.settlement_sent_at,
   settlementAmountSent: r.settlement_amount_sent,
   settlementSignedAt: r.settlement_signed_at,
+  settlementAttemptAt: r.settlement_attempt_at,
+  settlementAttemptAmount: r.settlement_attempt_amount,
+  settlementSeenAt: r.settlement_seen_at,
+  settlementSignUrl: r.settlement_sign_url,
   paymentDetailsReceivedAt: r.payment_details_received_at,
   receivedAt: r.received_at,
   updatedAt: r.updated_at,
@@ -75,6 +84,9 @@ export interface NewClaim {
   statusLabel: string | null;
   amountClaimed: number | null;
   receivedAt: string;
+  // The claim number already on the item, if any (e.g. an item taken in again
+  // after a restore): kept when it is well-formed and no other claim has it.
+  claimNumber?: string | null;
 }
 
 export type ClaimPatch = Partial<{
@@ -96,6 +108,10 @@ export type ClaimPatch = Partial<{
   settlementReferenceId: string | null;
   settlementAmountSent: number | null;
   settlementSignedAt: string | null;
+  settlementAttemptAt: string | null;
+  settlementAttemptAmount: number | null;
+  settlementSeenAt: string | null;
+  settlementSignUrl: string | null;
   paymentDetailsReceivedAt: string | null;
 }>;
 
@@ -118,10 +134,22 @@ const PATCH_COLUMNS: Record<keyof ClaimPatch, string> = {
   settlementReferenceId: 'settlement_reference_id',
   settlementAmountSent: 'settlement_amount_sent',
   settlementSignedAt: 'settlement_signed_at',
+  settlementAttemptAt: 'settlement_attempt_at',
+  settlementAttemptAmount: 'settlement_attempt_amount',
+  settlementSeenAt: 'settlement_seen_at',
+  settlementSignUrl: 'settlement_sign_url',
   paymentDetailsReceivedAt: 'payment_details_received_at',
 };
 
 export const formatClaimNumber = (seq: number): string => `HDC-${String(seq).padStart(6, '0')}`;
+
+// The sequence number of a claim number exactly as formatClaimNumber writes it, else null.
+export function claimSeqOf(claimNumber: string | null | undefined): number | null {
+  const m = /^HDC-(\d{6,9})$/.exec(claimNumber?.trim() ?? '');
+  if (!m) return null;
+  const seq = Number(m[1]);
+  return seq > 0 && formatClaimNumber(seq) === claimNumber!.trim() ? seq : null;
+}
 
 export class Repo {
   constructor(readonly db: Db) {}
@@ -189,9 +217,18 @@ export class Repo {
     return this.db.transaction(() => {
       const existing = this.getClaim(input.itemId);
       if (existing) return { claim: existing, created: false };
-      const seq = (this.db.prepare('UPDATE claim_number_seq SET last = last + 1 WHERE id = 1 RETURNING last').get() as {
-        last: number;
-      }).last;
+      // An item that already carries its own claim number (its claim was lost in
+      // a restore) keeps it, and the sequence moves past it so it is never handed
+      // out again. Otherwise (none, malformed, or another claim's) a new one.
+      const kept = claimSeqOf(input.claimNumber);
+      const free = kept !== null && !this.db.prepare('SELECT 1 FROM claims WHERE seq = ? OR claim_number = ?').get(kept, formatClaimNumber(kept));
+      let seq: number;
+      if (free) {
+        seq = kept;
+        this.db.prepare('UPDATE claim_number_seq SET last = MAX(last, ?) WHERE id = 1').run(seq);
+      } else {
+        seq = (this.db.prepare('UPDATE claim_number_seq SET last = last + 1 WHERE id = 1 RETURNING last').get() as { last: number }).last;
+      }
       const now = nowIso();
       this.db
         .prepare(
@@ -377,9 +414,82 @@ export class Repo {
     return this.db.prepare('INSERT OR IGNORE INTO processed_events (event_key, created_at) VALUES (?, ?)').run(eventKey, nowIso())
       .changes === 1;
   }
+
+  // Claims with this (E.164) phone, most recently received first.
+  findClaimsByPhone(phone: string): Claim[] {
+    const rows = this.db
+      .prepare('SELECT * FROM claims WHERE phone = ? ORDER BY received_at DESC')
+      .all(phone.trim()) as ClaimRow[];
+    return rows.map(toClaim);
+  }
+
+  // Forgets every browser trusted for the claim (they proved they could read an
+  // email address the claim no longer has). The link itself keeps working.
+  deleteDevices(itemId: string): number {
+    return this.db.prepare('DELETE FROM devices WHERE item_id = ?').run(itemId).changes;
+  }
+
+  // How many files the claimant has on the claim (portal uploads and claimant
+  // file columns) and their total size, for the per-claim upload allowance.
+  claimantFileTotals(itemId: string): { count: number; bytes: number } {
+    const r = this.db
+      .prepare("SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes FROM files WHERE item_id = ? AND source = 'claimant'")
+      .get(itemId) as { count: number; bytes: number };
+    return { count: r.count, bytes: r.bytes };
+  }
+
+  // Messages on the claim from this direction and channel since the given ISO time.
+  countMessagesSince(itemId: string, direction: MessageDirection, channel: MessageChannel, sinceIso: string): number {
+    const r = this.db
+      .prepare('SELECT COUNT(*) AS n FROM messages WHERE item_id = ? AND direction = ? AND channel = ? AND created_at >= ?')
+      .get(itemId, direction, channel, sinceIso) as { n: number };
+    return r.n;
+  }
+
+  // Processed-event keys that start with prefix, oldest first.
+  eventKeysWithPrefix(prefix: string): string[] {
+    const rows = this.db
+      .prepare('SELECT event_key FROM processed_events WHERE substr(event_key, 1, ?) = ? ORDER BY created_at, rowid')
+      .all(prefix.length, prefix) as Array<{ event_key: string }>;
+    return rows.map((r) => r.event_key);
+  }
+
+  // Retention: deletes processed-event keys that start with prefix and were
+  // recorded before beforeIso. Returns how many. Only for keys that are safe to
+  // forget (webhook delivery ids); see pruneOldRecords in services/jobs.ts.
+  deleteProcessedEventsBefore(prefix: string, beforeIso: string): number {
+    if (!prefix) throw new Error('deleteProcessedEventsBefore needs a key prefix');
+    return this.db
+      .prepare('DELETE FROM processed_events WHERE substr(event_key, 1, ?) = ? AND created_at < ?')
+      .run(prefix.length, prefix, beforeIso).changes;
+  }
+
+  // Settlements the poller still has to look at: sent (or a send of unknown
+  // outcome) and not signed. Least recently checked first, then oldest sent, so
+  // a capped run still reaches every claim in turn.
+  listSettlementsToCheck(limit: number): Claim[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM claims
+         WHERE settlement_signed_at IS NULL AND (settlement_sent_at IS NOT NULL OR settlement_attempt_at IS NOT NULL)
+         ORDER BY settlement_checked_at IS NOT NULL, settlement_checked_at,
+                  COALESCE(settlement_sent_at, settlement_attempt_at), item_id
+         LIMIT ?`,
+      )
+      .all(limit) as ClaimRow[];
+    return rows.map(toClaim);
+  }
+
+  // Poller bookkeeping: when the claim's settlement was last checked, and when its
+  // document was last found in HighLevel. Not a change to the claim, so
+  // updated_at stays as it was.
+  markSettlementChecked(itemId: string, o: { checkedAt?: string; seenAt?: string }): void {
+    if (o.checkedAt) this.db.prepare('UPDATE claims SET settlement_checked_at = ? WHERE item_id = ?').run(o.checkedAt, itemId);
+    if (o.seenAt) this.db.prepare('UPDATE claims SET settlement_seen_at = ? WHERE item_id = ?').run(o.seenAt, itemId);
+  }
 }
 
-const toMessage = (r: Record<string, unknown>): ClaimMessage => ({
+const toMessage =(r: Record<string, unknown>): ClaimMessage => ({
   id: r.id as number,
   itemId: r.item_id as string,
   direction: r.direction as MessageDirection,

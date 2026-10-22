@@ -2,8 +2,10 @@ import { escapeHtml, html, raw, type Html } from '../web/html.js';
 
 // Turns a rendered plain-text template into a branded HTML email (inline styles,
 // table layout, so it holds up in Outlook and Gmail) and a matching plain-text
-// version. Every piece of text is escaped; http(s) URLs become links, and a link
-// on its own line becomes a button when we know what it is.
+// version. Every piece of text is escaped; http(s) URLs on our own site (or the
+// payment form) become links, and a link on its own line becomes a button when
+// we know what it is. Any other URL stays plain text, so text that came from a
+// claimant can't turn into a clickable link in an email from us.
 
 const BRAND = 'Home Delivery Claims';
 const FONT = raw("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif");
@@ -25,9 +27,36 @@ export interface EmailContent {
   // Rendered template text: paragraphs separated by blank lines.
   bodyText: string;
   claimNumber: string;
-  // URLs that become buttons when they sit on a line of their own. A claim page
-  // link (/c/<token>) is always a "View your claim" button.
+  // URLs that become buttons when they sit on a line of their own. A linkable
+  // claim page link (/c/<token>) is always a "View your claim" button.
   buttons?: EmailButton[];
+  // The only URLs made into links: those under one of these prefixes (same
+  // origin, and the prefix's path or below it), e.g. PUBLIC_BASE_URL and the
+  // payment form URL. Without it, no URL in the text is linked.
+  linkPrefixes?: string[];
+}
+
+type LinkCheck = (url: string) => boolean;
+
+function linkCheck(prefixes: string[] = []): LinkCheck {
+  const allowed = prefixes.flatMap((p) => {
+    try {
+      const u = new URL(p);
+      return [{ origin: u.origin, path: u.pathname.replace(/\/+$/, '') }];
+    } catch {
+      return [];
+    }
+  });
+  return (url) => {
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      return false;
+    }
+    if (u.username || u.password) return false;
+    return allowed.some((a) => u.origin === a.origin && (!a.path || u.pathname === a.path || u.pathname.startsWith(`${a.path}/`)));
+  };
 }
 
 const URL_RE = /https?:\/\/[^\s<>"'`]+/g;
@@ -48,21 +77,21 @@ const isClaimPageUrl = (url: string): boolean => {
 const link = (url: string): Html =>
   html`<a href="${url}" style="color:${BRAND_BG};text-decoration:underline;word-break:break-all;">${url}</a>`;
 
-// Escapes text and links its http(s) URLs, leaving trailing punctuation outside the link.
-function linkify(text: string): Html {
+// Escapes text and links its allowed http(s) URLs, leaving trailing punctuation outside the link.
+function linkify(text: string, allowed: LinkCheck): Html {
   let out = '';
   let last = 0;
   for (const m of text.matchAll(URL_RE)) {
     const url = m[0].replace(TRAILING_PUNCT_RE, '');
-    if (!/^https?:\/\/./.test(url)) continue;
+    if (!/^https?:\/\/./.test(url) || !allowed(url)) continue;
     out += escapeHtml(text.slice(last, m.index)) + link(url).value;
     last = m.index + url.length;
   }
   return raw(out + escapeHtml(text.slice(last)));
 }
 
-const paragraph = (lines: string[]): Html =>
-  html`<p style="margin:0 0 16px;">${lines.map((l, i) => html`${i ? raw('<br>') : ''}${linkify(l)}`)}</p>`;
+const paragraph = (lines: string[], allowed: LinkCheck): Html =>
+  html`<p style="margin:0 0 16px;">${lines.map((l, i) => html`${i ? raw('<br>') : ''}${linkify(l, allowed)}`)}</p>`;
 
 const button = (url: string, label: string): Html => html`<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:4px 0 8px;border-collapse:separate;">
 <tr><td align="center" bgcolor="${BUTTON_BG}" style="background:${BUTTON_BG};border-radius:8px;">
@@ -74,10 +103,10 @@ const button = (url: string, label: string): Html => html`<table role="presentat
 const codeBlock = (code: string): Html =>
   html`<p style="margin:0 0 16px;font-family:Menlo,Consolas,'Courier New',monospace;font-size:30px;font-weight:700;letter-spacing:6px;color:${INK};">${code}</p>`;
 
-function bodyHtml(text: string, buttons: Map<string, string>): Html {
+function bodyHtml(text: string, buttons: Map<string, string>, allowed: LinkCheck): Html {
   const labelFor = (line: string): string | null => {
     if (!LONE_URL_RE.test(line)) return null;
-    return buttons.get(line) ?? (isClaimPageUrl(line) ? 'View your claim' : null);
+    return buttons.get(line) ?? (isClaimPageUrl(line) && allowed(line) ? 'View your claim' : null);
   };
   const blocks: Html[] = [];
   for (const para of normalize(text).split(/\n[ \t]*\n+/)) {
@@ -87,7 +116,7 @@ function bodyHtml(text: string, buttons: Map<string, string>): Html {
     }
     let lines: string[] = [];
     const flush = () => {
-      if (lines.some((l) => l.trim())) blocks.push(paragraph(lines));
+      if (lines.some((l) => l.trim())) blocks.push(paragraph(lines, allowed));
       lines = [];
     };
     for (const line of para.split('\n')) {
@@ -135,7 +164,7 @@ export function renderEmailHtml(c: EmailContent): string {
 <table role="presentation" class="container" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;background:#ffffff;border:1px solid ${LINE};border-radius:10px;">
 <tr><td class="px" style="background:${BRAND_BG};padding:18px 32px;border-radius:10px 10px 0 0;font-family:${FONT};font-size:19px;font-weight:700;letter-spacing:0.01em;color:#ffffff;">${BRAND}</td></tr>
 <tr><td class="px" style="padding:28px 32px 12px;font-family:${FONT};font-size:16px;line-height:1.6;color:${INK};">
-${bodyHtml(c.bodyText, buttons)}
+${bodyHtml(c.bodyText, buttons, linkCheck(c.linkPrefixes))}
 </td></tr>
 <tr><td class="px" style="padding:16px 32px 24px;border-top:1px solid ${LINE};font-family:${FONT};font-size:13px;line-height:1.5;color:${INK_SOFT};">
 <p style="margin:0 0 6px;">${footerText(c.claimNumber)}</p>

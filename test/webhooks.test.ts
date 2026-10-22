@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { JOB } from '../src/services/contracts.js';
 import { buildApp } from '../src/web/app.js';
-import { makeTestEnv, type TestEnv } from './helpers.js';
+import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
 
 const apps: FastifyInstance[] = [];
 afterEach(async () => {
@@ -124,15 +124,22 @@ describe('Monday webhook', () => {
     expect(jobsOf(env)).toEqual([]);
   });
 
-  it('queues changes to claimant-visible file columns only', async () => {
+  it('queues changes to claimant-visible file columns and the email and phone columns only', async () => {
     const { env, app } = await setup();
-    const visible = [env.board.sharedFileColumns[0]!, env.board.columns.signedSettlement, env.board.columns.intakePhotos!, env.board.columns.claimantUploads];
+    const visible = [
+      env.board.sharedFileColumns[0]!,
+      env.board.columns.signedSettlement,
+      env.board.columns.intakePhotos!,
+      env.board.columns.claimantUploads,
+      env.board.columns.email,
+      env.board.columns.phone,
+    ];
     for (const [i, columnId] of visible.entries()) {
       const res = await post(app, MONDAY, mondayEvent(env, { type: 'update_column_value', triggerUuid: `f-${i}`, columnId, columnType: 'file', value: { files: [] } }));
       expect(res.json()).toMatchObject({ result: 'queued' });
     }
-    // An internal file column and an ordinary text column are never read.
-    for (const columnId of ['file_internal_invoices', env.board.columns.email]) {
+    // An internal file column and any other column are never read.
+    for (const columnId of ['file_internal_invoices', env.board.columns.amountClaimed!, 'text_internal_notes']) {
       const res = await post(app, MONDAY, mondayEvent(env, { type: 'update_column_value', triggerUuid: `x-${columnId}`, columnId, columnType: 'file', value: { files: [] } }));
       expect(res.json()).toMatchObject({ ignored: expect.any(String) });
     }
@@ -158,6 +165,42 @@ describe('Monday webhook', () => {
         },
         dedupe_key: 'update:8880001',
       },
+    ]);
+  });
+
+  it('a corrected email on the board reaches the claim page and HighLevel at once, without reading files', async () => {
+    const { env, app } = await setup();
+    const item = addClaimItem(env, { email: 'jane@gmial.com' });
+    await env.ctx.services.intake.handleItemCreated(item.id);
+    const contactId = env.ctx.repo.getClaim(item.id)!.highlevelContactId!;
+    env.monday.setText(item.id, env.board.columns.email, 'jane@gmail.com', 'email');
+    const assetReads = env.monday.callsTo('getAssets').length;
+
+    const res = await post(app, MONDAY, {
+      event: { boardId: Number(env.board.claimsBoardId), pulseId: Number(item.id), userId: 111, triggerUuid: 'mail-fix', type: 'update_column_value', columnId: env.board.columns.email, columnType: 'email', value: { email: 'jane@gmail.com', text: 'jane@gmail.com' } },
+    });
+    expect(res.json()).toMatchObject({ result: 'queued' });
+    await env.ctx.jobs.drain();
+
+    const claim = env.ctx.repo.getClaim(item.id)!;
+    expect(claim.email).toBe('jane@gmail.com');
+    expect(env.highlevel.contacts.get(claim.highlevelContactId!)!.email).toBe('jane@gmail.com');
+    expect(claim.highlevelContactId).toBe(contactId); // same contact, matched on the phone
+    expect(env.monday.callsTo('getAssets').length).toBe(assetReads);
+  });
+
+  it("never queues the text of internal notes; claimant messages and updates without text are queued", async () => {
+    const { env, app } = await setup();
+    const note = mondayEvent(env, { type: 'create_update', updateId: 8880002, triggerUuid: 'n-1', body: '<p>Fraud check: claimant seems fine, max 900</p>', textBody: 'Fraud check: claimant seems fine, max 900' });
+    const res = await post(app, MONDAY, note);
+    expect(res.json()).toMatchObject({ ok: true, ignored: expect.any(String) });
+    expect(JSON.stringify(jobsOf(env))).not.toContain('Fraud check');
+
+    await post(app, MONDAY, mondayEvent(env, { type: 'create_update', updateId: 8880003, triggerUuid: 'n-2', body: '<p>to  CLAIMANT: hi</p>', textBody: 'to  CLAIMANT: hi' }));
+    await post(app, MONDAY, mondayEvent(env, { type: 'create_update', updateId: 8880004, triggerUuid: 'n-3', body: '', textBody: '' }));
+    expect(jobsOf(env).map((j) => [j.dedupe_key, j.payload.textBody])).toEqual([
+      ['update:8880003', 'to  CLAIMANT: hi'],
+      ['update:8880004', ''],
     ]);
   });
 

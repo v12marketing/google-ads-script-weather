@@ -1,11 +1,15 @@
 import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { nowIso } from '../db/index.js';
 import type { Claim } from '../domain/types.js';
-import type { AuthService, CoreContext, Services } from './contracts.js';
+import { html } from '../web/html.js';
+import { businessDate, onceFor } from './claim-fields.js';
+import type { AuthService, CoreContext, LoginCodeCheck, LoginCodeResult, Services } from './contracts.js';
+import { ContactConflictError } from './notifier.js';
 
 // Portal device trust. A browser proves it can read the claim's email with a
 // one-time code; from then on its device cookie is trusted for that claim until
-// the claim's tokenVersion changes. Device ids and codes are stored only as
+// the claim's tokenVersion changes or the claim's email does (intake.refreshClaim
+// then forgets its devices). Device ids and codes are stored only as
 // hashes, and neither is ever logged.
 
 // 32 random bytes, base64url: what the signed hdc_device cookie carries.
@@ -13,10 +17,12 @@ export const DEVICE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 
 export const LOGIN_CODE_TTL_MS = 10 * 60_000;
 export const LOGIN_CODE_MAX_ATTEMPTS = 5;
-const CODE_LIMITS = [
-  { windowMs: 15 * 60_000, max: 3 },
-  { windowMs: 24 * 60 * 60_000, max: 10 },
-];
+// A code only works in the browser that asked for it, so the short-window limit
+// is per claim and browser: someone else holding the link can't use up the
+// claimant's codes. Browser ids cost nothing to make, so a generous daily cap
+// per claim keeps the claimant's inbox from being flooded.
+export const DEVICE_CODE_LIMIT = { windowMs: 15 * 60_000, max: 3 };
+export const CLAIM_CODE_LIMIT = { windowMs: 24 * 60 * 60_000, max: 20 };
 const CLAIM_LINKS_WINDOW_MS = 60 * 60_000;
 const CLAIM_LINKS_MAX = 3;
 const MAX_LISTED_CLAIMS = 20;
@@ -78,18 +84,33 @@ export function createAuthService(ctx: CoreContext, services: Services): AuthSer
     return true;
   }
 
-  async function sendLoginCode(claim: Claim, deviceId: string): Promise<{ sent: boolean; maskedEmail: string }> {
+  // The daily cap only runs out if codes keep being asked for, most likely by
+  // someone else who has the claim's link. Tell the team (once a day) so they can
+  // replace the link and send the claimant the new one.
+  const tellTeamCodeLimit = (claim: Claim): Promise<unknown> =>
+    onceFor(ctx, `login-code-limit:${claim.itemId}:${businessDate(nowIso())}`, (once) =>
+      ctx.monday.createUpdate(
+        claim.itemId,
+        html`<p>The claim page has emailed its daily maximum of ${CLAIM_CODE_LIMIT.max} login codes for this claim, so the claimant can't get a code on a new browser until tomorrow.</p>
+<p>If the claimant didn't ask for them all, someone else may have the claim link: replace the link in /admin and email the claimant the new one.</p>`.value,
+        once,
+      ),
+    ).catch((err) => log.warn({ itemId: claim.itemId, err: safeErr(err) }, 'auth: posting the login code limit note failed'));
+
+  async function sendLoginCode(claim: Claim, deviceId: string): Promise<LoginCodeResult> {
     const maskedEmail = maskEmail(claim.email);
     if (!maskedEmail || !validDevice(deviceId)) return { sent: false, maskedEmail };
     const dh = deviceHash(deviceId);
 
-    const issued = db.transaction(() => {
-      for (const { windowMs, max } of CODE_LIMITS) {
-        const { n } = db
-          .prepare('SELECT COUNT(*) AS n FROM login_codes WHERE item_id = ? AND created_at > ?')
-          .get(claim.itemId, isoAgo(windowMs)) as { n: number };
-        if (n >= max) return null;
-      }
+    const issued = db.transaction((): { id: number; code: string } | { limited: 'device' | 'claim' } => {
+      const { n: forDevice } = db
+        .prepare('SELECT COUNT(*) AS n FROM login_codes WHERE item_id = ? AND device_hash = ? AND created_at > ?')
+        .get(claim.itemId, dh, isoAgo(DEVICE_CODE_LIMIT.windowMs)) as { n: number };
+      if (forDevice >= DEVICE_CODE_LIMIT.max) return { limited: 'device' };
+      const { n: forClaim } = db
+        .prepare('SELECT COUNT(*) AS n FROM login_codes WHERE item_id = ? AND created_at > ?')
+        .get(claim.itemId, isoAgo(CLAIM_CODE_LIMIT.windowMs)) as { n: number };
+      if (forClaim >= CLAIM_CODE_LIMIT.max) return { limited: 'claim' };
       db.prepare('DELETE FROM login_codes WHERE item_id = ? AND created_at < ?').run(claim.itemId, isoAgo(KEEP_CODES_MS));
       const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
       const now = Date.now();
@@ -99,40 +120,56 @@ export function createAuthService(ctx: CoreContext, services: Services): AuthSer
       return { id: Number(res.lastInsertRowid), code };
     })();
 
-    if (!issued) {
-      log.info({ itemId: claim.itemId }, 'auth: login code rate-limited');
-      return { sent: false, maskedEmail };
+    if ('limited' in issued) {
+      log.info({ itemId: claim.itemId, limit: issued.limited }, 'auth: login code rate-limited');
+      if (issued.limited === 'claim') void tellTeamCodeLimit(claim);
+      return { sent: false, maskedEmail, limited: issued.limited };
     }
 
     try {
-      // login_code is an email-only template: the notifier never texts it.
+      // login_code is an email-only template: the notifier never texts it, and
+      // only emails a HighLevel contact whose email is the claim's.
       const res = await services.notifier.notify(claim, 'login_code', { code: issued.code });
       if (!res.emailSent) throw new Error('login code email was not sent');
     } catch (err) {
       // Never delivered: drop it so it can't be used and doesn't count against the limit.
       db.prepare('DELETE FROM login_codes WHERE id = ?').run(issued.id);
-      log.warn({ itemId: claim.itemId, err: safeErr(err) }, 'auth: login code email failed');
+      if (err instanceof ContactConflictError) {
+        log.warn({ itemId: claim.itemId }, "auth: login code not sent: the claim's HighLevel contact doesn't have its email");
+      } else {
+        log.warn({ itemId: claim.itemId, err: safeErr(err) }, 'auth: login code email failed');
+      }
       throw err;
     }
     log.info({ itemId: claim.itemId }, 'auth: login code sent');
     return { sent: true, maskedEmail };
   }
 
-  function verifyLoginCode(claim: Claim, deviceId: string, code: string, userAgent?: string): 'ok' | 'invalid' | 'expired' | 'locked' {
+  function verifyLoginCode(claim: Claim, deviceId: string, code: string, userAgent?: string): LoginCodeCheck {
     if (!validDevice(deviceId)) return 'invalid';
     const dh = deviceHash(deviceId);
     const given = typeof code === 'string' ? code.replace(/[\s-]/g, '') : '';
 
-    return db.transaction(() => {
+    // This browser has no usable code, but another one has a live code for the
+    // claim: most likely the code was asked for there (or this is a link opened
+    // from the email on another device), so say so instead of "expired".
+    const noCodeHere = (): 'expired' | 'other_device' => {
+      const other = db
+        .prepare('SELECT 1 FROM login_codes WHERE item_id = ? AND device_hash != ? AND used_at IS NULL AND expires_at > ? LIMIT 1')
+        .get(claim.itemId, dh, nowIso());
+      return other ? 'other_device' : 'expired';
+    };
+
+    return db.transaction((): LoginCodeCheck => {
       const row = db
         .prepare(
           `SELECT id, code_hash, attempts, expires_at FROM login_codes
            WHERE item_id = ? AND device_hash = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1`,
         )
         .get(claim.itemId, dh) as { id: number; code_hash: string; attempts: number; expires_at: string } | undefined;
-      if (!row) return 'expired';
+      if (!row) return noCodeHere();
       if (row.attempts >= LOGIN_CODE_MAX_ATTEMPTS) return 'locked';
-      if (row.expires_at <= nowIso()) return 'expired';
+      if (row.expires_at <= nowIso()) return noCodeHere();
       // A typo that can't be a code isn't a guess; don't spend an attempt on it.
       if (!/^\d{6}$/.test(given)) return 'invalid';
 

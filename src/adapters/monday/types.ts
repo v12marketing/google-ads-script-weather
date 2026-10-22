@@ -36,6 +36,13 @@ export interface MondayUpdate {
   createdAt: string;
 }
 
+// For writes that must not happen twice. Monday replays the first response to a
+// mutation with the same Idempotency-Key for 30 minutes, so a job retried after
+// a lost response (applied, but timed out) doesn't post the update again.
+export interface MondayWriteOptions {
+  idempotencyKey?: string;
+}
+
 export interface MondayApi {
   getItem(itemId: string, columnIds?: string[]): Promise<MondayItem | null>;
   getUpdate(updateId: string): Promise<MondayUpdate | null>;
@@ -45,10 +52,10 @@ export interface MondayApi {
   changeColumnValues(boardId: string, itemId: string, values: Record<string, unknown>): Promise<void>;
 
   // Posts an update (comment) on the item. `body` is HTML. Returns the update id.
-  createUpdate(itemId: string, body: string): Promise<string>;
+  createUpdate(itemId: string, body: string, opts?: MondayWriteOptions): Promise<string>;
 
   // In-app notification to a Monday user, linked to the item.
-  notifyUser(userId: string, itemId: string, text: string): Promise<void>;
+  notifyUser(userId: string, itemId: string, text: string, opts?: MondayWriteOptions): Promise<void>;
 
   getAssets(assetIds: string[]): Promise<MondayAsset[]>;
   // Streams/downloads an asset's bytes (resolves the short-lived public URL internally).

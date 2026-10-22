@@ -53,6 +53,13 @@ const EnvSchema = z.object({
   // Max bytes per claimant upload.
   MAX_UPLOAD_BYTES: z.coerce.number().int().default(25 * 1024 * 1024),
   LOG_LEVEL: z.string().default('info'),
+  // Background work: the job queue, the settlement re-check and retention. Set
+  // to false only to try a restored backup on a scratch server (docs/SETUP.md
+  // section 12), so the copy doesn't run its queued jobs against the live board.
+  WORKER_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;
@@ -94,6 +101,7 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     ADMIN_PASSWORD_HASH: 'scrypt$unset$unset',
     MAX_UPLOAD_BYTES: 25 * 1024 * 1024,
     LOG_LEVEL: 'silent',
+    WORKER_ENABLED: true,
     ...overrides,
   };
 }

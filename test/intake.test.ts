@@ -106,9 +106,50 @@ describe('intake.handleItemCreated', () => {
     expect(cb).toMatchObject({ smsOptIn: false, amountClaimed: 400, phone: '+16035550199' });
   });
 
+  it("keeps a claim number the item already has (e.g. after a restore), and never hands it out again (#27)", async () => {
+    const env = makeTestEnv();
+    const { intake } = env.ctx.services;
+    const c = env.board.columns;
+    // HDC-000501 was emailed to the claimant, but the restored database is older.
+    const lost = addClaimItem(env, { name: 'Lost Claim', email: 'lost@example.com', phone: '+16035550111' });
+    env.monday.setText(lost.id, c.claimNumber, 'HDC-000501');
+    await intake.handleItemCreated(lost.id);
+    expect(env.ctx.repo.getClaim(lost.id)!.claimNumber).toBe('HDC-000501');
+    // Its number on the board is left alone, and the claimant's emails show it.
+    expect(env.monday.callsTo('changeColumnValues').some(([, , v]) => c.claimNumber in (v as Record<string, unknown>))).toBe(false);
+    expect(env.highlevel.emails.at(-1)!.text).toContain('HDC-000501');
+
+    // The next new claim gets a number after it.
+    const next = addClaimItem(env, { name: 'New Claim', email: 'new@example.com', phone: '+16035550122' });
+    await intake.handleItemCreated(next.id);
+    expect(env.ctx.repo.getClaim(next.id)!.claimNumber).toBe('HDC-000502');
+
+    // A copy of an item (same number as another claim) or a malformed value gets a new number.
+    const copy = addClaimItem(env, { name: 'Copy', email: 'copy@example.com', phone: '+16035550133' });
+    env.monday.setText(copy.id, c.claimNumber, 'HDC-000501');
+    const typo = addClaimItem(env, { name: 'Typo', email: 'typo@example.com', phone: '+16035550144' });
+    env.monday.setText(typo.id, c.claimNumber, 'HDC-12');
+    await intake.handleItemCreated(copy.id);
+    await intake.handleItemCreated(typo.id);
+    expect(env.ctx.repo.getClaim(copy.id)!.claimNumber).toBe('HDC-000503');
+    expect(env.ctx.repo.getClaim(typo.id)!.claimNumber).toBe('HDC-000504');
+    expect(env.monday.mustItem(copy.id).columnValues[c.claimNumber]!.text).toBe('HDC-000503');
+
+    // A lower number lost in a restore is kept too, and the sequence doesn't move back.
+    const older = addClaimItem(env, { name: 'Older', email: 'older@example.com', phone: '+16035550155' });
+    env.monday.setText(older.id, c.claimNumber, 'HDC-000400');
+    await intake.handleItemCreated(older.id);
+    expect(env.ctx.repo.getClaim(older.id)!.claimNumber).toBe('HDC-000400');
+    const last = addClaimItem(env, { name: 'Last', email: 'last@example.com', phone: '+16035550166' });
+    await intake.handleItemCreated(last.id);
+    expect(env.ctx.repo.getClaim(last.id)!.claimNumber).toBe('HDC-000505');
+  });
+
   it('writes the claim number, date received and portal link back to the item', async () => {
     const env = makeTestEnv();
     const item = addClaimItem(env);
+    // 9:30pm in New York on October 21 (already the 22nd in UTC).
+    item.createdAt = '2026-10-22T01:30:00.000Z';
     await env.ctx.services.intake.handleItemCreated(item.id);
 
     const claim = env.ctx.repo.getClaim(item.id)!;
@@ -119,7 +160,10 @@ describe('intake.handleItemCreated', () => {
     expect(boardId).toBe(env.board.claimsBoardId);
     expect(itemId).toBe(item.id);
     expect(values[c.claimNumber]).toBe('HDC-000001');
-    expect(values[c.dateReceived!]).toEqual({ date: claim.receivedAt.slice(0, 10) });
+    // The date the claimant is told, not the UTC date.
+    expect(claim.receivedAt).toBe('2026-10-22T01:30:00.000Z');
+    expect(values[c.dateReceived!]).toEqual({ date: '2026-10-21' });
+    expect(env.highlevel.emails[0]!.text).toContain('Date received: October 21, 2026');
     const link = values[c.portalLink!] as string;
     expect(link).toMatch(/^https:\/\/claims\.test\/c\/[A-Za-z0-9_-]{43}$/);
     // The link opens this claim.

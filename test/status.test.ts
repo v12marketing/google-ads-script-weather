@@ -143,6 +143,56 @@ describe('status.handleStatusChanged', () => {
     expect(notify.mock.calls.map((c) => c[1])).toEqual(['settlement_offered']);
   });
 
+  describe('stale or out-of-order events (the board has moved on)', () => {
+    it('a retried older event neither overwrites the newer status nor messages the claimant', async () => {
+      const { env, item, notify } = await setup({ smsOptIn: false });
+      env.highlevel.failNext = 1;
+      await expect(setStatus(env, item.id, 'Under review', 'evt-1')).rejects.toThrow(/simulated failure/);
+      await setStatus(env, item.id, 'More info needed', 'evt-2');
+      expect(env.highlevel.emails).toHaveLength(1);
+
+      // evt-1's job is retried after evt-2 was handled.
+      await env.ctx.services.status.handleStatusChanged(item.id, 'Under review', 'evt-1');
+
+      expect(env.highlevel.emails).toHaveLength(1);
+      // The only "under review" attempt is the one that failed.
+      expect(notify.mock.calls.map((c) => c[1])).toEqual(['under_review', 'more_info_needed']);
+      expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'more_info_needed', statusLabel: 'More info needed' });
+      expect(env.ctx.repo.isEventProcessed('status:evt-1:done')).toBe(true);
+    });
+
+    it('a stale "Settlement offered" never sends the settlement document', async () => {
+      const { env, item, notify } = await setup();
+      env.monday.setText(item.id, env.board.columns.settlementAmount, '900', 'numbers');
+      // Offered, then moved back before the event was handled.
+      env.monday.setText(item.id, env.board.columns.status, 'Under review', 'status');
+      await env.ctx.services.status.handleStatusChanged(item.id, 'Settlement offered', 'evt-1');
+
+      expect(env.highlevel.settlementRequests).toHaveLength(0);
+      expect(notify).not.toHaveBeenCalled();
+      expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'under_review', statusLabel: 'Under review', settlementSentAt: null });
+      expect(systemMessages(env, item.id)).toEqual(['Claim received']);
+    });
+
+    it('an event superseded by an internal label sends nothing and keeps the cached status', async () => {
+      const { env, item, notify } = await setup();
+      env.monday.setText(item.id, env.board.columns.status, 'Waiting on carrier', 'status');
+      await env.ctx.services.status.handleStatusChanged(item.id, 'Under review', 'evt-1');
+
+      expect(notify).not.toHaveBeenCalled();
+      expect(env.highlevel.emails).toHaveLength(0);
+      expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'received', statusLabel: 'New' });
+    });
+
+    it('caches the label as the board writes it', async () => {
+      const { env, item } = await setup();
+      env.monday.setText(item.id, env.board.columns.status, 'Under review', 'status');
+      await env.ctx.services.status.handleStatusChanged(item.id, ' under REVIEW', 'evt-1');
+      expect(env.ctx.repo.getClaim(item.id)).toMatchObject({ statusKey: 'under_review', statusLabel: 'Under review' });
+      expect(env.highlevel.emails).toHaveLength(1);
+    });
+  });
+
   it('settlement signed: notifies with the payment form link', async () => {
     const { env, item, notify } = await setup();
     await setStatus(env, item.id, 'Settlement signed', 'evt-1');

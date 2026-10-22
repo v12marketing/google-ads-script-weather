@@ -36,6 +36,15 @@ export interface Claim {
   // Amount on the settlement document that was sent (may differ from the board if it changed since).
   settlementAmountSent: number | null;
   settlementSignedAt: string | null;
+  // A send to HighLevel whose outcome is unknown (timed out, failed, process
+  // stopped): when it started and for what amount. Cleared once the document's
+  // ids are known or the attempt is given up.
+  settlementAttemptAt: string | null;
+  settlementAttemptAmount: number | null;
+  // Last time the open document was found in HighLevel.
+  settlementSeenAt: string | null;
+  // The claimant's signing link for the open document, when HighLevel gives one.
+  settlementSignUrl: string | null;
   paymentDetailsReceivedAt: string | null;
   receivedAt: string; // ISO timestamp
   updatedAt: string;

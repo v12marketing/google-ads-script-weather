@@ -42,7 +42,8 @@
     "signatureColumn": "text_ref",
     "verificationColumn": "status_verification",
     "verifiedLabel": "Verified",
-    "mismatchLabel": "Check claim number"
+    "mismatchLabel": "Check claim number",
+    "duplicateLabel": "Duplicate submission"
   },
   "claimantMessagePrefix": "To claimant:",
   "notifyUserIds": ["111", "222"]

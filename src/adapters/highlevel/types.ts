@@ -13,6 +13,16 @@ export interface ContactInput {
   customFields?: Record<string, string>;
 }
 
+// Who a contact reaches: HighLevel sends email/SMS to the contact's own email and
+// phone. An upsert reports the contact it matched or created, which may not be
+// the one asked for: HighLevel matches an existing contact on email OR phone
+// (the location's duplicate rule) and overwrites its other details.
+export interface ContactIdentity {
+  id: string;
+  email: string | null;
+  phone: string | null;
+}
+
 export interface SendEmailInput {
   contactId: string;
   subject: string;
@@ -35,8 +45,12 @@ export interface SettlementRequest {
 }
 
 export interface HighLevelApi {
-  // Creates or updates the contact; returns the contact id.
-  upsertContact(input: ContactInput): Promise<string>;
+  // Creates or updates the contact (POST /contacts/upsert). Returns the contact
+  // HighLevel matched or created, with the email and phone it has now. A null
+  // email/phone in the input is not sent, so the contact keeps its own.
+  upsertContact(input: ContactInput): Promise<ContactIdentity>;
+  // The contact's current email and phone (GET /contacts/{id}); null if it no longer exists.
+  getContact(contactId: string): Promise<ContactIdentity | null>;
   updateContactFields(contactId: string, customFields: Record<string, string>): Promise<void>;
   addTags(contactId: string, tags: string[]): Promise<void>;
   removeTags(contactId: string, tags: string[]): Promise<void>;
@@ -44,16 +58,32 @@ export interface HighLevelApi {
   sendSms(input: SendSmsInput): Promise<{ messageId: string | null }>;
   // Sends the settlement template (POST /proposals/templates/send) after writing
   // claim_number / settlement_amount to the contact's custom fields. The two ids
-  // are both kept because HighLevel's identifier format is ambiguous.
-  requestSettlementSignature(req: SettlementRequest): Promise<{ documentId: string | null; referenceId: string | null }>;
+  // are both kept because HighLevel's identifier format is ambiguous. Never
+  // retried here: when it throws, HighLevel may still have sent the document
+  // (timeout, network error, 5xx), so the caller looks for it (findSentDocuments)
+  // before sending again.
+  requestSettlementSignature(req: SettlementRequest): Promise<SettlementDocumentRef>;
   // Checks the document via GET /proposals/document. Signed only when the status
   // is completed, it is not expired/deleted, and every signer (including this
   // contact) has hasCompleted + signedDate — staff can "Mark as Completed" in the
   // UI without signatures. The signed PDF is NOT available through the API.
-  verifySignedDocument(
-    ref: { documentId: string | null; referenceId: string | null },
-    contactId: string,
-  ): Promise<SignedDocumentCheck>;
+  // sentAt (when the document was sent) narrows the list to a date window.
+  verifySignedDocument(ref: SettlementDocumentRef, contactId: string, opts?: { sentAt?: string | null }): Promise<SignedDocumentCheck>;
+  // Documents sent to this contact (recipients[].id) created at or after `since`,
+  // other than the `exclude`d ones, oldest first (GET /proposals/document over a
+  // dateFrom/dateTo window). Recovers the ids of a send whose response was lost.
+  findSentDocuments(contactId: string, since: string, exclude?: SettlementDocumentRef[]): Promise<SentDocument[]>;
+}
+
+export interface SettlementDocumentRef {
+  documentId: string | null;
+  referenceId: string | null;
+}
+
+export interface SentDocument extends SettlementDocumentRef {
+  createdAt: string | null;
+  // The contact's own signing link (recipients[].shareLink), https only.
+  signUrl: string | null;
 }
 
 export interface SignedDocumentCheck {
@@ -63,6 +93,9 @@ export interface SignedDocumentCheck {
   signedAt: string | null;
   signerIp: string | null;
   documentName: string | null;
+  // The contact's signing link (recipients[].shareLink, https only) when the
+  // document was found and HighLevel gives one.
+  signUrl?: string | null;
 }
 
 // Normalised inbound events from HighLevel webhooks.

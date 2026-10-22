@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import type { HighLevelEvent } from '../adapters/highlevel/types.js';
 import type { MondayEvent } from '../adapters/monday/types.js';
 import type { Claim, ClaimMessage, MessageChannel } from '../domain/types.js';
-import { textToHtml } from '../web/html.js';
-import { onceFor } from './claim-fields.js';
+import { html, textToHtml } from '../web/html.js';
+import { idempotencyKeyFor, onceFor } from './claim-fields.js';
 import { JOB, type CoreContext, type MessagingService, type Services } from './contracts.js';
 import { stripEmailReply } from './email-reply.js';
 import { ClaimantInputError } from './errors.js';
@@ -52,6 +52,39 @@ const keywordOf = (body: string): string => body.trim().replace(/[.!?]+$/, '').t
 
 const isOpen = (c: Claim): boolean => c.statusKey !== 'closed' && c.statusKey !== 'denied';
 
+// Claim numbers as our emails and texts write them ("HDC-000123"), in order.
+const CLAIM_NUMBER_RE = /\bHDC-\d{6,}\b/gi;
+const claimNumbersIn = (text: string | null | undefined): string[] =>
+  [...(text ?? '').matchAll(CLAIM_NUMBER_RE)].map((m) => m[0].toUpperCase());
+
+type InboundEvent = Extract<HighLevelEvent, { kind: 'inbound_message' }>;
+
+// Which of the contact's claims (newest first) an email or text is about: the
+// first claim number it mentions that is one of them (our email subjects carry
+// it, and replies quote our text), else the newest open claim, else the newest
+// claim. `otherOpen` lists the contact's other open claims when the newest open
+// one was only a guess.
+export function routeInbound(
+  claims: Claim[],
+  event: Pick<InboundEvent, 'channel' | 'subject' | 'body'>,
+): { claim: Claim; otherOpen: Claim[] } | null {
+  if (!claims.length) return null;
+  const texts = event.channel === 'email' ? [event.subject, stripEmailReply(event.body), event.body] : [event.body];
+  for (const text of texts) {
+    for (const n of claimNumbersIn(text)) {
+      const named = claims.find((c) => c.claimNumber.toUpperCase() === n);
+      if (named) return { claim: named, otherOpen: [] };
+    }
+  }
+  const open = claims.filter(isOpen);
+  if (!open.length) return { claim: claims[0]!, otherOpen: [] };
+  return { claim: open[0]!, otherOpen: open.slice(1) };
+}
+
+// Marks a claimant email/text that named no claim while the contact had other
+// open claims, so its Monday post can say so.
+const unroutedKey = (messageId: number): string => `claimant-msg:${messageId}:unrouted`;
+
 // HTML for the Monday update that carries a claimant's message.
 export function claimantUpdateHtml(m: Pick<ClaimMessage, 'channel' | 'body'>): string {
   return `<p><strong>From claimant (${CHANNEL_LABEL[m.channel]}):</strong></p>\n${textToHtml(m.body).value}`;
@@ -61,7 +94,7 @@ export function claimantUpdateHtml(m: Pick<ClaimMessage, 'channel' | 'body'>): s
 // a retried job only notifies the ones that failed.
 export async function notifyTeam(ctx: CoreContext, claim: Claim, keyBase: string, text: string): Promise<void> {
   for (const userId of ctx.board.notifyUserIds) {
-    await onceFor(ctx, `${keyBase}:notify:${userId}`, () => ctx.monday.notifyUser(userId, claim.itemId, text));
+    await onceFor(ctx, `${keyBase}:notify:${userId}`, (once) => ctx.monday.notifyUser(userId, claim.itemId, text, once));
   }
 }
 
@@ -70,12 +103,31 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
 
   // Stores a claimant message and queues its Monday post in one transaction.
   // Null when the HighLevel message id was already recorded.
-  function recordFromClaimant(claim: Claim, channel: MessageChannel, body: string, highlevelMessageId: string | null): ClaimMessage | null {
+  function recordFromClaimant(
+    claim: Claim,
+    channel: MessageChannel,
+    body: string,
+    highlevelMessageId: string | null,
+    unrouted = false,
+  ): ClaimMessage | null {
     return db.transaction(() => {
       const m = repo.addMessage({ itemId: claim.itemId, direction: 'from_claimant', channel, body, highlevelMessageId });
+      if (m && unrouted) repo.markEventProcessed(unroutedKey(m.id));
       if (m) jobs.enqueue(JOB.portalMessageToMonday, { messageId: m.id }, { dedupeKey: `claimant-msg:${m.id}` });
       return m;
     })();
+  }
+
+  // For an email/text that named no claim: tells the team which other open
+  // claims the claimant has, since the message may be about one of those.
+  function otherOpenClaimsNote(claim: Claim, m: ClaimMessage): string {
+    if (!claim.highlevelContactId || !repo.isEventProcessed(unroutedKey(m.id))) return '';
+    const others = repo.findClaimsByContact(claim.highlevelContactId).filter((c) => c.itemId !== claim.itemId && isOpen(c));
+    if (!others.length) return '';
+    const numbers = others.map((c) => c.claimNumber).join(', ');
+    const what = CHANNEL_LABEL[m.channel];
+    return html`\n<p><em>The claimant also has other open claims: ${numbers}. This ${what} did not name a claim, so it was filed on their newest open claim. If it is about another claim, please follow up there.</em></p>`
+      .value;
   }
 
   // Sends a team message to the claimant. Safe to repeat: the notifier skips
@@ -88,19 +140,32 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     repo.markEventProcessed(doneKey);
   }
 
+  // A team message on a claims-board item that intake hasn't handled yet (an item
+  // from before go-live, a missed create_item, or intake still retrying): run
+  // intake first, as status changes do. Throws while there is still no claim, so
+  // the job retries instead of dropping the message.
+  async function claimForUpdate(event: Extract<MondayEvent, { kind: 'update_created' }>): Promise<Claim | null> {
+    const { itemId, updateId } = event;
+    const cached = repo.getClaim(itemId);
+    if (cached) return cached;
+    if (event.boardId !== board.claimsBoardId) {
+      log.info({ itemId, updateId }, 'messaging: update on an item that is not on the claims board, ignoring');
+      return null;
+    }
+    await services.intake.handleItemCreated(itemId);
+    const claim = repo.getClaim(itemId);
+    if (!claim) throw new Error(`No claim for item ${itemId} yet; the team message will be retried`);
+    return claim;
+  }
+
   async function handleMondayUpdate(event: Extract<MondayEvent, { kind: 'update_created' }>): Promise<void> {
     const { itemId, updateId } = event;
-    const claim = repo.getClaim(itemId);
-    if (!claim) {
-      log.info({ itemId, updateId }, 'messaging: update on an item that is not a claim, ignoring');
-      return;
-    }
-
     const prior = repo.getMessageByMondayUpdateId(updateId);
     if (prior) {
       // Either our own post of a claimant message, or a redelivery / retry of a
       // team message already stored (finish sending it).
-      if (prior.itemId === itemId && prior.direction === 'to_claimant') await sendToClaimant(claim, prior);
+      const claim = repo.getClaim(itemId);
+      if (claim && prior.itemId === itemId && prior.direction === 'to_claimant') await sendToClaimant(claim, prior);
       return;
     }
 
@@ -120,6 +185,8 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     const body = claimantMessageBody(cleanMessageText(textBody), board.claimantMessagePrefix);
     if (!body) return; // internal note: never sent, never stored
 
+    const claim = await claimForUpdate(event);
+    if (!claim) return;
     const m = repo.addMessage({ itemId, direction: 'to_claimant', channel: 'monday', body, mondayUpdateId: updateId });
     if (!m) return;
     log.info({ itemId, updateId, messageId: m.id }, 'messaging: team message for the claimant');
@@ -151,23 +218,31 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     if (!claim) throw new PermanentJobError(`No claim for message ${messageId}`);
     if (!m.mondayUpdateId) {
       // Posted as the integration user, so the update_created webhook is ignored.
-      const updateId = await monday.createUpdate(m.itemId, claimantUpdateHtml(m));
+      // The key is the message's own (its time too: ids restart after a restore),
+      // so a retry after a lost response doesn't post the message twice.
+      const updateId = await monday.createUpdate(m.itemId, claimantUpdateHtml(m) + otherOpenClaimsNote(claim, m), {
+        idempotencyKey: idempotencyKeyFor(`claimant-msg:${m.itemId}:${m.id}:${m.createdAt}`),
+      });
       repo.setMessageMondayUpdateId(m.id, updateId);
       log.info({ itemId: m.itemId, messageId, updateId }, 'messaging: claimant message posted to Monday');
     }
     await notifyTeam(ctx, claim, `claimant-msg:${m.id}`, `${claim.claimNumber}: new message from the claimant`);
   }
 
-  async function replyWithStatus(claim: Claim, messageId: string | null): Promise<void> {
-    const send = async () => {
-      const t = services.templates.get('status_reply');
-      // Amounts and payment links never go by SMS.
-      const vars = { ...services.templates.vars(claim), amountClaimed: '', settlementAmount: '', paymentFormUrl: '' };
-      const sent = await services.notifier.sendSms(claim, services.templates.render(t.sms, vars));
-      log.info({ itemId: claim.itemId, sent }, 'messaging: STATUS keyword reply');
-    };
-    if (messageId) await onceFor(ctx, `inbound:${messageId}:status`, send);
-    else await send();
+  // One reply per claim asked about (each open claim of the contact), each sent
+  // only if that claim may be texted.
+  async function replyWithStatus(claims: Claim[], messageId: string | null): Promise<void> {
+    for (const claim of claims) {
+      const send = async () => {
+        const t = services.templates.get('status_reply');
+        // Amounts and payment links never go by SMS.
+        const vars = { ...services.templates.vars(claim), amountClaimed: '', settlementAmount: '', paymentFormUrl: '' };
+        const sent = await services.notifier.sendSms(claim, services.templates.render(t.sms, vars));
+        log.info({ itemId: claim.itemId, sent }, 'messaging: STATUS keyword reply');
+      };
+      if (messageId) await onceFor(ctx, `inbound:${messageId}:status:${claim.itemId}`, send);
+      else await send();
+    }
   }
 
   // STOP applies to the HighLevel contact, so to every claim it is linked to.
@@ -186,22 +261,23 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
     if (!optedOut) return;
     for (const c of claims) {
       if (!repo.isEventProcessed(changedKey(c.itemId))) continue;
-      await onceFor(ctx, `${changedKey(c.itemId)}:posted`, () => monday.createUpdate(c.itemId, OPT_OUT_UPDATE));
+      await onceFor(ctx, `${changedKey(c.itemId)}:posted`, (once) => monday.createUpdate(c.itemId, OPT_OUT_UPDATE, once));
     }
   }
 
-  async function handleInbound(event: Extract<HighLevelEvent, { kind: 'inbound_message' }>): Promise<void> {
+  async function handleInbound(event: InboundEvent): Promise<void> {
     const claims = repo.findClaimsByContact(event.contactId);
-    const claim = claims.find(isOpen) ?? claims[0];
-    if (!claim) {
+    const route = routeInbound(claims, event);
+    if (!route) {
       log.info({ contactId: event.contactId, channel: event.channel }, 'messaging: inbound message from a contact with no claim');
       return;
     }
+    const { claim, otherOpen } = route;
 
     if (event.channel === 'sms') {
       const kw = keywordOf(event.body);
       const eventId = event.messageId ?? createHash('sha256').update(`${event.contactId}\n${event.body}`).digest('hex').slice(0, 32);
-      if (kw === 'STATUS') return replyWithStatus(claim, event.messageId);
+      if (kw === 'STATUS') return replyWithStatus([claim, ...otherOpen], event.messageId);
       if (kw === 'HELP') return; // HighLevel / the carrier answer HELP
       if (OPT_OUT_KEYWORDS.has(kw)) return setSmsOptOut(claims, true, eventId);
       // "Yes" is usually an answer to the team, unless the contact is opted out.
@@ -212,12 +288,15 @@ export function createMessagingService(ctx: CoreContext, services: Services): Me
 
     const body = cleanMessageText(event.channel === 'email' ? stripEmailReply(event.body) : event.body);
     if (!body) return;
-    const m = recordFromClaimant(claim, event.channel, body, event.messageId);
+    const m = recordFromClaimant(claim, event.channel, body, event.messageId, otherOpen.length > 0);
     if (!m) {
       log.info({ itemId: claim.itemId }, 'messaging: inbound message already recorded');
       return;
     }
-    log.info({ itemId: claim.itemId, messageId: m.id, channel: event.channel }, 'messaging: claimant replied');
+    log.info(
+      { itemId: claim.itemId, messageId: m.id, channel: event.channel, otherOpenClaims: otherOpen.length },
+      'messaging: claimant replied',
+    );
   }
 
   return { handleMondayUpdate, postFromPortal, deliverPortalMessage, handleInbound };

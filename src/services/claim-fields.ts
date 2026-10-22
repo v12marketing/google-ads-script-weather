@@ -1,4 +1,5 @@
-import type { MondayColumnValue, MondayItem } from '../adapters/monday/types.js';
+import { createHash } from 'node:crypto';
+import type { MondayColumnValue, MondayItem, MondayWriteOptions } from '../adapters/monday/types.js';
 import type { BoardConfig } from '../board-config.js';
 import type { CoreContext } from './contracts.js';
 
@@ -30,13 +31,44 @@ export function claimColumnIds(board: BoardConfig): string[] {
   );
 }
 
+// The business's time zone: the dates claimants are told and the dates on the board.
+export const BUSINESS_TIME_ZONE = 'America/New_York';
+
+const ymdFormat = new Intl.DateTimeFormat('en-US', { timeZone: BUSINESS_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+
+// "2026-10-21" for 2026-10-22T01:30Z: the calendar date in BUSINESS_TIME_ZONE.
+export function businessDate(iso: string): string {
+  const parts = Object.fromEntries(ymdFormat.formatToParts(new Date(iso)).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+// The item name comes from the public claim form, so it is the claimant's own
+// text. A word that looks like a link, domain or email address is never put in
+// a message: mail apps would make it clickable.
+const LINK_LIKE_RE = /:\/\/|[/\\@<>]|www\.|\w\.[a-z]{2,}/i;
+export const isLinkLike = (word: string): boolean => LINK_LIKE_RE.test(word);
+
+// The name without link-like words.
+export const cleanName = (name: string): string =>
+  name
+    .split(/\s+/)
+    .filter((w) => w && !isLinkLike(w))
+    .join(' ');
+
+// The first word of the name for "Hi {{firstName}}"; '' (so "Hi there") when it
+// looks like a link or is too long to be a name.
+export function firstNameOf(name: string): string {
+  const first = name.trim().split(/\s+/)[0] ?? '';
+  return first.length <= 40 && !isLinkLike(first) ? first : '';
+}
+
 export function readClaimFields(board: BoardConfig, item: MondayItem): ClaimFields {
   const c = board.columns;
   const col = (id: string | undefined) => (id ? item.columnValues[id] : undefined);
   const name = item.name.trim();
   return {
     name,
-    firstName: name.split(/\s+/)[0] ?? '',
+    firstName: firstNameOf(name),
     email: parseEmail(col(c.email)),
     phone: parsePhone(col(c.phone)),
     smsOptIn: parseCheckbox(col(c.smsOptIn)),
@@ -149,12 +181,18 @@ export function formatUtc(iso: string | null): string {
 // Runs a side effect (usually a Monday update) once per key. The key is recorded
 // only after it succeeds, so a failed call is retried with its job instead of
 // being lost. Jobs run one at a time, so check-then-record is safe here.
-export async function onceFor(ctx: CoreContext, key: string, fn: () => Promise<unknown>): Promise<boolean> {
+export async function onceFor(ctx: CoreContext, key: string, fn: (once: MondayWriteOptions) => Promise<unknown>): Promise<boolean> {
   if (ctx.repo.isEventProcessed(key)) return false;
-  await fn();
+  // Passed to the one Monday write fn makes, so a retry after a lost response
+  // (the write applied, the key not yet marked) doesn't post it twice.
+  await fn({ idempotencyKey: idempotencyKeyFor(key) });
   ctx.repo.markEventProcessed(key);
   return true;
 }
+
+// A Monday Idempotency-Key for a write that must happen once per `key` (Monday
+// remembers it for 30 minutes). Hashed: keys can be long and carry ids.
+export const idempotencyKeyFor = (key: string): string => `hdc-${createHash('sha256').update(key).digest('hex').slice(0, 32)}`;
 
 // Records a system timeline entry once per key.
 export function addSystemMessageOnce(ctx: CoreContext, key: string, itemId: string, body: string): void {

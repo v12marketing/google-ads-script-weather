@@ -177,6 +177,7 @@ async function check(client: MondayClient, config: AppConfig, cfg: BoardConfig):
       checkLabels(r, payment, pb.verificationColumn, [
         { label: pb.verifiedLabel, why: 'verifiedLabel' },
         { label: pb.mismatchLabel, why: 'mismatchLabel' },
+        { label: pb.duplicateLabel, why: 'duplicateLabel' },
       ]);
     }
   } else {
@@ -230,12 +231,16 @@ function wantedHooks(cfg: BoardConfig): Wanted[] {
     { boardId: claims, event: 'create_item', columnId: null, config: null },
     // The only documented form of the status config.
     { boardId: claims, event: 'change_status_column_value', columnId: status, config: { columnId: status, columnValue: { $any$: true } } },
-    ...visibleFileColumns(cfg).map(({ columnId }) => ({
-      boardId: claims,
-      event: 'change_specific_column_value',
-      columnId,
-      config: { columnId },
-    })),
+    // Claimant-visible file columns, and the email and phone columns (so a
+    // correction reaches the claim page and HighLevel before the next message).
+    ...[...visibleFileColumns(cfg).map((c) => c.columnId), cfg.columns.email, cfg.columns.phone]
+      .filter((columnId): columnId is string => !!columnId)
+      .map((columnId) => ({
+        boardId: claims,
+        event: 'change_specific_column_value',
+        columnId,
+        config: { columnId },
+      })),
     { boardId: claims, event: 'create_update', columnId: null, config: null },
   ];
   // The payment board is subscribed to new items only; its bank-detail columns are never read.

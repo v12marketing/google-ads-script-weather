@@ -5,6 +5,7 @@ import { parseHighLevelWebhook, verifyHighLevelSignature } from '../../adapters/
 import type { MondayEvent } from '../../adapters/monday/types.js';
 import { parseMondayWebhook, verifyMondayAuthorization } from '../../adapters/monday/webhook.js';
 import { JOB, type AppContext } from '../../services/contracts.js';
+import { claimantMessageBody, cleanMessageText } from '../../services/messaging.js';
 import { safeEqualStrings } from '../admin-auth.js';
 
 // Inbound webhooks. Handlers only check the secret path (and a signature where
@@ -31,6 +32,9 @@ class AlreadyProcessed extends Error {}
 export async function registerWebhookRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
   const { config, board, db, repo, jobs, log } = ctx;
   const fileColumns = new Set(visibleFileColumns(board).map((c) => c.columnId));
+  // A corrected email or phone must reach the cache (and the HighLevel contact)
+  // before the next message, not at the next status change.
+  const contactColumns = new Set([board.columns.email, board.columns.phone].filter((c): c is string => !!c));
 
   // Encapsulated so the raw-body parser applies to these routes only.
   await app.register(async (hooks) => {
@@ -94,15 +98,22 @@ export async function registerWebhookRoutes(app: FastifyInstance, ctx: AppContex
             };
           }
           case 'column_changed':
-            // Internal file columns (and every non-file column) are never read.
-            if (!fileColumns.has(ev.columnId)) return null;
+            // Claimant-visible file columns and the email/phone columns only.
+            // Internal file columns (and every other column) are never read.
+            if (!fileColumns.has(ev.columnId) && !contactColumns.has(ev.columnId)) return null;
             return {
               type: JOB.mondayColumnChanged,
               payload: { itemId: ev.itemId, columnId: ev.columnId },
               dedupeKey: `column:${ev.triggerUuid ?? sha256(raw)}`,
             };
-          case 'update_created':
+          case 'update_created': {
+            // Internal notes (no claimant prefix) are never stored, not even in
+            // the job queue: one whose text came with the event is dropped here.
+            // An event without text is queued as is, and the job reads it from Monday.
+            const text = cleanMessageText(ev.textBody);
+            if (text && !claimantMessageBody(text, board.claimantMessagePrefix)) return null;
             return { type: JOB.mondayUpdateCreated, payload: ev, dedupeKey: `update:${ev.updateId}` };
+          }
         }
       }
       if (board.paymentBoard && ev.boardId === board.paymentBoard.boardId && ev.kind === 'item_created') {

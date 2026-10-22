@@ -3,7 +3,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { nowIso } from '../src/db/index.js';
 import type { AppConfig } from '../src/config.js';
 import { PermanentJobError } from '../src/services/jobs.js';
-import { adminCsrfToken, FailureLimiter, hashPassword, parseBasicAuth, verifyPassword } from '../src/web/admin-auth.js';
+import { adminCsrfToken, clientKey, ConcurrencyLimit, FailureLimiter, hashPassword, parseBasicAuth, verifyPassword } from '../src/web/admin-auth.js';
 import { smsLength } from '../src/web/routes/admin.js';
 import { buildApp } from '../src/web/app.js';
 import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
@@ -85,6 +85,37 @@ describe('admin-auth', () => {
     expect(l.blockedFor('5.6.7.8', 10)).toBe(0);
     expect(l.blockedFor('1.2.3.4', 1001)).toBe(0);
   });
+
+  it('counts attempts still being checked, so concurrent guesses cannot get past the limit', () => {
+    const l = new FailureLimiter(3, 1000);
+    expect([l.begin('k', 0), l.begin('k', 0), l.begin('k', 0), l.begin('k', 0)]).toEqual([true, true, true, false]);
+    expect(l.blockedFor('k', 0)).toBeGreaterThan(0);
+    l.cancel('k'); // turned away before its password was checked: not a failure
+    expect(l.begin('k', 0)).toBe(true);
+    l.fail('k', 0);
+    l.fail('k', 0);
+    expect(l.blockedFor('k', 0)).toBeGreaterThan(0); // 2 failed + 1 still in flight
+    l.succeed('k');
+    expect(l.blockedFor('k', 0)).toBe(0);
+    expect(l.begin('other', 0)).toBe(true);
+  });
+
+  it('keys clients by address, and IPv6 clients by /64', () => {
+    expect(clientKey('203.0.113.7')).toBe('203.0.113.7');
+    expect(clientKey('::ffff:203.0.113.7')).toBe('203.0.113.7');
+    expect(clientKey('2001:db8:a:b::1')).toBe('2001:db8:a:b::/64');
+    expect(clientKey('2001:DB8:A:B:ffff:1:2:3')).toBe('2001:db8:a:b::/64');
+    expect(clientKey('2001:0db8:000a:000b:0:0:0:1')).toBe('2001:db8:a:b::/64');
+    expect(clientKey('2001:db8::1')).toBe('2001:db8:0:0::/64');
+    expect(clientKey('2001:db8:a:c::1')).not.toBe(clientKey('2001:db8:a:b::1'));
+  });
+
+  it('lets only a few slow checks run at once', () => {
+    const gate = new ConcurrencyLimit(2);
+    expect([gate.tryAcquire(), gate.tryAcquire(), gate.tryAcquire()]).toEqual([true, true, false]);
+    gate.release();
+    expect(gate.tryAcquire()).toBe(true);
+  });
 });
 
 describe('admin sign-in', () => {
@@ -118,6 +149,48 @@ describe('admin sign-in', () => {
     expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
     // Another address is unaffected.
     expect((await app.inject({ method: 'GET', url: '/admin', headers: AUTH(), remoteAddress: '198.51.100.9' })).statusCode).toBe(200);
+  });
+
+  it('counts concurrent guesses before checking them, so a burst gets no more than the limit', async () => {
+    const { app } = await setup();
+    const guess = (tag: string) => get(app, '/admin', { authorization: basic('admin', `guess-${tag}`) });
+    const burst = await Promise.all(Array.from({ length: 30 }, (_, i) => guess(`burst-${i}`)));
+    let wrong = burst.filter((r) => r.statusCode === 401).length;
+    expect(wrong).toBeGreaterThan(0);
+    expect(wrong).toBeLessThanOrEqual(2); // the rest were turned away, not checked
+    expect(burst.filter((r) => r.statusCode === 429)).toHaveLength(30 - wrong);
+    for (let round = 0; round < 10; round++) {
+      const rs = await Promise.all(Array.from({ length: 5 }, (_, i) => guess(`${round}-${i}`)));
+      wrong += rs.filter((r) => r.statusCode === 401).length;
+    }
+    expect(wrong).toBe(10);
+    expect((await get(app, '/admin')).statusCode).toBe(429);
+    expect((await app.inject({ method: 'GET', url: '/admin', headers: AUTH(), remoteAddress: '198.51.100.9' })).statusCode).toBe(200);
+  });
+
+  it('checks at most two passwords at once, from any number of addresses, and turns the rest away', async () => {
+    const { app } = await setup();
+    const burst = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        app.inject({ method: 'GET', url: '/admin', headers: { authorization: basic('admin', `guess-${i}`) }, remoteAddress: `198.51.100.${i + 1}` }),
+      ),
+    );
+    expect(burst.filter((r) => r.statusCode === 401).length).toBeLessThanOrEqual(2);
+    const busy = burst.find((r) => r.statusCode === 429)!;
+    expect(busy.body).toContain('being checked right now');
+    expect(busy.headers['retry-after']).toBe('5');
+    // Being turned away isn't a failed attempt.
+    expect((await app.inject({ method: 'GET', url: '/admin', headers: AUTH(), remoteAddress: '198.51.100.20' })).statusCode).toBe(200);
+  });
+
+  it('limits an IPv6 client per /64, not per address', async () => {
+    const { app } = await setup();
+    const from = (remoteAddress: string, headers: Record<string, string> = AUTH()) => app.inject({ method: 'GET', url: '/admin', headers, remoteAddress });
+    for (let i = 1; i <= 10; i++) {
+      expect((await from(`2001:db8:a:b::${i.toString(16)}`, { authorization: basic('admin', `guess-${i}`) })).statusCode).toBe(401);
+    }
+    expect((await from('2001:db8:a:b:ffff:1:2:3')).statusCode).toBe(429);
+    expect((await from('2001:db8:a:c::1')).statusCode).toBe(200);
   });
 
   it('shows dashboard counts', async () => {
@@ -239,6 +312,42 @@ describe('admin templates', () => {
     expect(env.ctx.repo.getTemplateOverride('login_code')).toBeNull();
   });
 
+  it('offers only the claim page text of the received status, whose email and text are never sent', async () => {
+    const { env, app, csrf } = await setup();
+    const list = await get(app, '/admin/templates');
+    const row = /<a href="\/admin\/templates\/received">[\s\S]*?<\/tr>/.exec(list.body)![0];
+    expect(row).toContain('Only the claim page text is used');
+    expect(row).toContain('New claim confirmation');
+    expect(row).not.toContain('Sent when');
+
+    const page = await get(app, '/admin/templates/received');
+    expect(page.body).toContain('name="portalText"');
+    for (const name of ['emailSubject', 'emailBody', 'sms']) expect(page.body).not.toContain(`name="${name}"`);
+    expect(page.body).toContain('href="/admin/templates/confirmation"');
+
+    const preview = await postForm(app, '/admin/templates/received', { _csrf: csrf, action: 'preview', portalText: 'We have it, {{firstName}}.' });
+    expect(preview.body).toContain('We have it, Jane.');
+    expect(preview.body).not.toContain('<h3>Email</h3>');
+    expect(preview.body).not.toContain('<h3>Text message</h3>');
+
+    // Email and text fields posted anyway are not taken.
+    const def = env.ctx.services.templates.getDefault('received');
+    const saved = await postForm(app, '/admin/templates/received', {
+      _csrf: csrf,
+      action: 'save',
+      emailSubject: 'Ignored',
+      emailBody: 'Ignored',
+      sms: 'Ignored',
+      portalText: 'We have your claim.',
+    });
+    expect(saved.statusCode).toBe(303);
+    expect(env.ctx.services.templates.get('received')).toEqual({ ...def, portalText: 'We have your claim.' });
+
+    // Other status templates keep their email and text fields.
+    const other = await get(app, '/admin/templates/under_review');
+    for (const name of ['emailSubject', 'emailBody', 'sms', 'portalText']) expect(other.body).toContain(`name="${name}"`);
+  });
+
   it('answers 404 for an unknown template', async () => {
     const { app } = await setup();
     expect((await get(app, '/admin/templates/nope')).statusCode).toBe(404);
@@ -306,7 +415,7 @@ describe('admin claims', () => {
     const { env, app, csrf } = await setup();
     const { tokens } = env.ctx.services;
     let claim = makeClaim(env);
-    claim = env.ctx.repo.updateClaim(claim.itemId, { highlevelContactId: await env.highlevel.upsertContact({ name: 'Jane Doe', firstName: 'Jane', email: 'jane@example.com', phone: null, smsOptIn: false }) })!;
+    claim = env.ctx.repo.updateClaim(claim.itemId, { highlevelContactId: (await env.highlevel.upsertContact({ name: 'Jane Doe', firstName: 'Jane', email: 'jane@example.com', phone: null, smsOptIn: false })).id })!;
     const oldToken = tokens.portalToken(claim.itemId, claim.tokenVersion);
     env.ctx.db
       .prepare('INSERT INTO devices (device_hash, item_id, token_version, user_agent, created_at, last_seen_at) VALUES (?, ?, ?, NULL, ?, ?)')
@@ -324,6 +433,8 @@ describe('admin claims', () => {
     const updated = env.ctx.repo.getClaim(claim.itemId)!;
     expect(updated.tokenVersion).toBe(claim.tokenVersion + 1);
     expect(tokens.claimForToken(oldToken)).toBeNull();
+    // The payment form link sent with the old link is retired too.
+    expect(env.ctx.services.payment.paymentFormUrl(updated)).not.toBe(env.ctx.services.payment.paymentFormUrl(claim));
     const newToken = tokens.portalToken(claim.itemId, updated.tokenVersion);
     expect(tokens.claimForToken(newToken)?.itemId).toBe(claim.itemId);
     expect(env.ctx.db.prepare('SELECT COUNT(*) AS n FROM devices WHERE item_id = ?').get(claim.itemId)).toEqual({ n: 0 });

@@ -8,12 +8,14 @@ import {
   type TemplateKey,
   type TemplateVars,
 } from '../domain/types.js';
+import { BUSINESS_TIME_ZONE } from './claim-fields.js';
 import type { CoreContext, Services, TemplateService } from './contracts.js';
 
 // Default copy for every claimant message. The team can override any of it from
 // /admin; overrides live in the templates table and `reset` falls back to these.
 // Rules baked into the copy: every email carries the claim number and the private
-// claim link with a do-not-forward note; SMS identifies the sender and never
+// claim link with a do-not-forward note (the sign-in code email carries no link,
+// see NO_CLAIM_LINK_TEMPLATE_KEYS); SMS identifies the sender and never
 // carries amounts; settlement amounts never appear in email or SMS.
 
 export const ALL_TEMPLATE_KEYS: readonly TemplateKey[] = [...STATUS_KEYS, ...EVENT_TEMPLATE_KEYS];
@@ -21,6 +23,11 @@ export const ALL_TEMPLATE_KEYS: readonly TemplateKey[] = [...STATUS_KEYS, ...EVE
 // Never sent by SMS: the login code proves the claimant reads the claim's email,
 // and claim links answer a request made for an email address.
 export const EMAIL_ONLY_TEMPLATE_KEYS: ReadonlySet<TemplateKey> = new Set<TemplateKey>(['login_code', 'claim_links']);
+
+// Emails without the claim-page link or button. The sign-in code is asked for on
+// the claim page and only works in that browser: a link in the email would open
+// the page in another browser (often the phone's), where the code can't work.
+export const NO_CLAIM_LINK_TEMPLATE_KEYS: ReadonlySet<TemplateKey> = new Set<TemplateKey>(['login_code']);
 
 export const TEMPLATE_VAR_NAMES: ReadonlyArray<keyof TemplateVars> = [
   'firstName',
@@ -96,13 +103,13 @@ const STATUS_DEFAULTS: Record<StatusKey, Omit<MessageTemplate, 'key'>> = {
     emailSubject: 'Your settlement offer for claim {{claimNumber}} is ready',
     emailBody: email(
       "Good news: we've prepared a settlement offer for your claim {{claimNumber}}.",
-      "You'll get a separate email from us shortly with the settlement document. Please review it and, if you agree, sign it electronically. It only takes a few minutes. The document is also linked on your claim page.",
+      "You'll get a separate email from us shortly with the settlement document. Please review it and, if you agree, sign it electronically. It only takes a few minutes. Can't find it? Check your spam or junk folder, or send us a message from your claim page and we'll resend it.",
       'If you have any questions about the offer, just reply to this email or send us a message from your claim page before you sign.',
       claimLink(),
     ),
     sms: 'Home Delivery Claims: Your settlement offer for claim {{claimNumber}} is ready. Watch for an email with the document to review and sign. Details: {{portalUrl}}',
     portalText:
-      "We've sent you a settlement offer to review and sign electronically. Look for an email from us with the settlement document, or open it from this page. If you have questions about the offer, send us a message below before you sign. Once you've signed, we'll ask how you'd like to be paid.",
+      "We've sent you a settlement offer to review and sign electronically. Look for an email from us with the settlement document. Can't find it? Check your spam or junk folder, or send us a message below and we'll resend it. If you have questions about the offer, send us a message below before you sign. Once you've signed, we'll ask how you'd like to be paid.",
   },
   settlement_signed: {
     emailSubject: "Claim {{claimNumber}}: choose how you'd like to be paid",
@@ -178,7 +185,6 @@ const EVENT_DEFAULTS: Record<EventTemplateKey, Omit<MessageTemplate, 'key'>> = {
       '{{code}}',
       "The code works for 10 minutes. Please don't share it with anyone. Our team will never ask you for it.",
       "If you didn't try to open your claim, you can ignore this email. Your claim stays private.",
-      claimLink(),
     ),
     sms: '',
     portalText: '',
@@ -221,7 +227,7 @@ const STATUS_FALLBACK_LABELS: Record<StatusKey, string> = {
   denied: 'Denied',
 };
 
-const dateFormat = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'long', day: 'numeric' });
+const dateFormat = new Intl.DateTimeFormat('en-US', { timeZone: BUSINESS_TIME_ZONE, year: 'numeric', month: 'long', day: 'numeric' });
 const moneyFormat = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 
 // "October 22, 2026", in the business's time zone.

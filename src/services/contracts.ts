@@ -69,17 +69,33 @@ export interface Notifier {
   // has SMS text) to the claimant. Ensures the HighLevel contact exists.
   // Pass eventKey to make retries safe: a channel already sent for that key is
   // skipped (recorded via repo.markEventProcessed after each successful send).
+  // Before sending, the contact is re-read from HighLevel: email goes only to a
+  // contact whose email is claim.email, SMS only to one whose phone is
+  // claim.phone (else the SMS is skipped). Throws ContactConflictError (a
+  // PermanentJobError) when no such contact can be had; nothing is sent then.
   notify(claim: Claim, key: TemplateKey, extra?: Partial<TemplateVars>, opts?: { eventKey?: string }): Promise<NotifyResult>;
-  // Sends one SMS outside the template system (STATUS replies).
+  // Sends one SMS outside the template system (STATUS replies). False when not
+  // allowed, or the contact's phone isn't the claim's.
   sendSms(claim: Claim, text: string): Promise<boolean>;
-  // Creates/updates the HighLevel contact for the claim and stores its id.
+  // Creates/updates the HighLevel contact for the claim and stores its id. Only
+  // ever stores a contact whose email is claim.email (no email: a contact without
+  // one), and never rewrites the email of a contact another claim uses with a
+  // different email: the phone is left off the upsert when it conflicts (texts
+  // are then off for the claim, and the team is told once). Throws
+  // ContactConflictError, after telling the team on the item, when HighLevel
+  // can't give such a contact.
   ensureContact(claim: Claim): Promise<string>;
 }
 
 export interface IntakeService {
-  // New item on the claims board: assign claim number, write it back, contact, confirmation.
+  // New item on the claims board: assign claim number, write it back, contact,
+  // confirmation. Resumable: a retry or redelivery finishes whatever an earlier
+  // run didn't (each step is idempotent), and refreshClaim does too.
   handleItemCreated(itemId: string): Promise<void>;
   // Refreshes the cached claim from the board (contact fields, status, amounts).
+  // Finishes an intake that didn't complete. When the email or phone changed, the
+  // HighLevel contact is synced again, and a changed email forgets the browsers
+  // trusted for the claim.
   refreshClaim(itemId: string): Promise<Claim | null>;
 }
 
@@ -102,9 +118,14 @@ export interface SettlementService {
 export interface PaymentService {
   // Payment WorkForm link pre-filled with the claim number and its HMAC signature.
   paymentFormUrl(claim: Claim): string;
-  paymentSignature(claimNumber: string): string;
+  // HMAC of the claim number and the claim's tokenVersion (default: the current
+  // one of the claim with that number), so replacing the claim link also
+  // revokes the payment form link sent before.
+  paymentSignature(claimNumber: string, tokenVersion?: number): string;
   // New item on the payment board: reads ONLY the claim-number and signature
-  // columns, labels the item verified/mismatch, and marks the claim's payment step.
+  // columns, labels the item verified/mismatch/duplicate (a second verified
+  // submission for a claim), and marks the claim's payment step. While either
+  // column is empty it re-checks later (create_item can beat the form answers).
   handlePaymentItemCreated(itemId: string): Promise<void>;
 }
 
@@ -129,14 +150,31 @@ export interface FileService {
   read(file: ClaimFile): Promise<Buffer>;
 }
 
+export interface LoginCodeResult {
+  sent: boolean;
+  maskedEmail: string;
+  // Set when rate-limited:
+  // 'device': this browser asked for several codes in the last 15 minutes; the
+  //   most recent one emailed for it still works, or it can ask again after that.
+  // 'claim': the claim's daily allowance (all browsers together) is used up; no
+  //   new code until the oldest of today's requests is a day old.
+  limited?: 'device' | 'claim';
+}
+
+// 'other_device': this browser has no usable code, but another browser has a
+// live one for the claim (it was asked for there): enter it there, or ask here.
+export type LoginCodeCheck = 'ok' | 'invalid' | 'expired' | 'locked' | 'other_device';
+
 export interface AuthService {
   // Device trust for the portal (one-time code to the claim's email).
   isDeviceTrusted(claim: Claim, deviceId: string | undefined): boolean;
-  // Sends a code; returns sent=false if rate-limited (or the claim has no email).
-  // deviceId binds the code to this browser. Throws when the email can't be
-  // delivered; the code is discarded first, so it neither works nor counts.
-  sendLoginCode(claim: Claim, deviceId: string): Promise<{ sent: boolean; maskedEmail: string }>;
-  verifyLoginCode(claim: Claim, deviceId: string, code: string, userAgent?: string): 'ok' | 'invalid' | 'expired' | 'locked';
+  // Sends a code; returns sent=false if rate-limited (`limited` says which limit)
+  // or the claim has no email. deviceId binds the code to this browser. Throws
+  // when the email can't be delivered; the code is discarded first, so it
+  // neither works nor counts. ContactConflictError (notifier.ts) means it can't
+  // be sent at all until the team fixes the claim's contact (they've been told).
+  sendLoginCode(claim: Claim, deviceId: string): Promise<LoginCodeResult>;
+  verifyLoginCode(claim: Claim, deviceId: string, code: string, userAgent?: string): LoginCodeCheck;
   newDeviceId(): string;
   csrfToken(deviceId: string, itemId: string): string;
   checkCsrf(deviceId: string, itemId: string, token: string | undefined): boolean;

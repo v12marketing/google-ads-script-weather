@@ -1,4 +1,4 @@
-import type { MondayApi, MondayAsset, MondayColumnValue, MondayItem, MondayUpdate } from './types.js';
+import type { MondayApi, MondayAsset, MondayColumnValue, MondayItem, MondayUpdate, MondayWriteOptions } from './types.js';
 
 // In-memory Monday board for tests and local development. Mutations are applied
 // to the stored items and recorded in `calls` so tests can assert on them.
@@ -16,6 +16,12 @@ export class FakeMonday implements MondayApi {
   calls: Array<{ method: string; args: unknown[] }> = [];
   // Set to make the next N calls throw, to exercise retries.
   failNext = 0;
+  // Set to make the next N createUpdate/notifyUser calls apply and then throw
+  // (a response lost after Monday applied the write).
+  loseNextResponse = 0;
+  // Like Monday: a write repeated with an Idempotency-Key it has seen returns the
+  // first result without being applied again.
+  private replays = new Map<string, unknown>();
   private nextId = 1000;
 
   constructor(private integrationUserId = '999') {}
@@ -120,18 +126,34 @@ export class FakeMonday implements MondayApi {
     }
   }
 
-  async createUpdate(itemId: string, body: string): Promise<string> {
-    this.maybeFail('createUpdate', [itemId, body]);
-    this.mustItem(itemId);
-    const textBody = body.replace(/<[^>]*>/g, '').trim();
-    const u: MondayUpdate = { id: this.id(), itemId, textBody, creatorId: this.integrationUserId, createdAt: new Date().toISOString() };
-    this.updates.set(u.id, u);
-    return u.id;
+  private idempotent<T>(opts: MondayWriteOptions | undefined, apply: () => T): T {
+    const key = opts?.idempotencyKey;
+    if (key && this.replays.has(key)) return this.replays.get(key) as T;
+    const result = apply();
+    if (key) this.replays.set(key, result);
+    if (this.loseNextResponse > 0) {
+      this.loseNextResponse--;
+      throw new Error('FakeMonday: simulated timeout (it may still have been applied)');
+    }
+    return result;
   }
 
-  async notifyUser(userId: string, itemId: string, text: string): Promise<void> {
+  async createUpdate(itemId: string, body: string, opts?: MondayWriteOptions): Promise<string> {
+    this.maybeFail('createUpdate', [itemId, body]);
+    this.mustItem(itemId);
+    return this.idempotent(opts, () => {
+      const textBody = body.replace(/<[^>]*>/g, '').trim();
+      const u: MondayUpdate = { id: this.id(), itemId, textBody, creatorId: this.integrationUserId, createdAt: new Date().toISOString() };
+      this.updates.set(u.id, u);
+      return u.id;
+    });
+  }
+
+  async notifyUser(userId: string, itemId: string, text: string, opts?: MondayWriteOptions): Promise<void> {
     this.maybeFail('notifyUser', [userId, itemId, text]);
-    this.notifications.push({ userId, itemId, text });
+    this.idempotent(opts, () => {
+      this.notifications.push({ userId, itemId, text });
+    });
   }
 
   async getAssets(assetIds: string[]): Promise<MondayAsset[]> {

@@ -136,6 +136,19 @@ const MIGRATIONS: string[] = [
   CREATE INDEX auth_rate_events_lookup ON auth_rate_events(kind, subject_hash, created_at);
   CREATE INDEX login_codes_device ON login_codes(item_id, device_hash, id);
   `,
+  `
+  -- Settlement bookkeeping (services/settlement.ts).
+  -- A send to HighLevel started at this time, for this amount, and its outcome is
+  -- unknown (timeout, 5xx, process stopped): no second document goes out until
+  -- HighLevel has been checked for one sent since.
+  ALTER TABLE claims ADD COLUMN settlement_attempt_at TEXT;
+  ALTER TABLE claims ADD COLUMN settlement_attempt_amount REAL;
+  -- Last time the stored document was found in HighLevel / last poller check.
+  ALTER TABLE claims ADD COLUMN settlement_seen_at TEXT;
+  ALTER TABLE claims ADD COLUMN settlement_checked_at TEXT;
+  -- The claimant's own signing link for the open document (recipients[].shareLink).
+  ALTER TABLE claims ADD COLUMN settlement_sign_url TEXT;
+  `,
 ];
 
 export function openDb(dataDir: string): Db {

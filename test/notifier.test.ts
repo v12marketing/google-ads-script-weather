@@ -140,6 +140,22 @@ describe('notify', () => {
     expect(highlevel.emails[0]!.subject).not.toContain('482913');
   });
 
+  it('sends the login code without the claim link or button, which would open the page where the code fails', async () => {
+    const { ctx, highlevel, notifier } = setup();
+    const claim = makeClaim(ctx);
+    await notifier.notify(claim, 'login_code', { code: '482913' });
+    const mail = highlevel.emails[0]!;
+    const portalUrl = ctx.services.tokens.portalUrl(claim);
+    expect(mail.html).toContain('482913');
+    expect(mail.html).not.toContain(portalUrl);
+    expect(mail.text).not.toContain(portalUrl);
+    expect(mail.html).not.toContain('View your claim');
+    // Other emails keep both.
+    await notifier.notify(claim, 'under_review');
+    expect(highlevel.emails[1]!.html).toContain(`href="${portalUrl}"`);
+    expect(highlevel.emails[1]!.html).toContain('View your claim');
+  });
+
   it('keeps settlement amounts out of email and all amounts out of SMS, even in edited templates', async () => {
     const { ctx, highlevel, notifier } = setup();
     ctx.services.templates.save(
@@ -168,7 +184,9 @@ describe('notify', () => {
     const mail = highlevel.emails[0]!;
     expect(mail.html).not.toMatch(/<script|<b>|<img/);
     expect(mail.html).toContain('&lt;script&gt;alert(&quot;hi&quot;)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;');
-    expect(mail.html).toContain('href="https://evil.test/"');
+    // Not our site: shown as text, never made a link.
+    expect(mail.html).not.toContain('href="https://evil.test');
+    expect(mail.html).toContain('https://evil.test/&quot;&gt;&lt;img src=x&gt;');
     expect(mail.text).toContain('<script>alert("hi")</script>');
     // The SMS points to the claim page rather than repeating the message.
     expect(highlevel.sms[0]!.message).not.toContain('script');

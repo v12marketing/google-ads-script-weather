@@ -275,6 +275,14 @@ describe('MondayClient errors and retries', () => {
     expect(sleeps).toEqual([1000]);
   });
 
+  it("sends the caller's Idempotency-Key for writes that must happen once, across job retries", async () => {
+    queue.push(json({ data: { create_update: { id: '5' } } }), json({ data: { create_notification: { text: 'hi' } } }));
+    await client().createUpdate('123', '<p>x</p>', { idempotencyKey: 'hdc-abc' });
+    await client().notifyUser('9', '123', 'hi', { idempotencyKey: 'hdc-def' });
+    expect(headers(0).get('idempotency-key')).toBe('hdc-abc');
+    expect(headers(1).get('idempotency-key')).toBe('hdc-def');
+  });
+
   it('retries queries on 5xx and gives up after the configured attempts', async () => {
     queue.push(new Response('oops', { status: 502 }), new Response('oops', { status: 503 }), new Response('oops', { status: 500 }));
     await expect(client(2).getItem('1')).rejects.toThrow('HTTP 500');

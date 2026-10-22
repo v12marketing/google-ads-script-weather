@@ -32,6 +32,17 @@ one; text messages are switched on at the end.
 - A Hetzner Cloud account.
 - Monday.com (Pro or Enterprise: URL pre-fill on forms and private boards need
   Pro or higher) with admin rights, and one spare seat for an integration user.
+  **Board size:** a board holds at most 10,000 items on Pro and 100,000 on
+  Enterprise, and every claim is one item. At about 1,000 claims a month a Pro
+  claims board is full in roughly 10 months, after which the claim form can't
+  create items and new claims stop arriving. At that volume choose Enterprise;
+  on any plan, archive finished claims regularly (section 12). The plan also sets
+  the daily API call allowance (about 10,000 a day on Pro, 25,000 on Enterprise).
+- Email hosting for the domain (e.g. Google Workspace or Microsoft 365) with two
+  mailboxes: `claims@homedeliveryclaims.com`, the contact address the site gives
+  claimants for help, privacy requests and paper copies (someone must read it
+  every working day), and `integration@homedeliveryclaims.com` for the Monday
+  integration user (5.1). DNS records for it are in section 3.
 - A HighLevel sub-account for the claims business, with Documents & Contracts and
   LC Phone (for SMS).
 - Access to the GitHub repository.
@@ -78,6 +89,7 @@ step 7 puts them all in place:
    timedatectl set-timezone America/New_York
    curl -fsSL https://get.docker.com | sh          # Docker Engine + Compose plugin
    docker compose version                         # should print v2.x or later
+   docker version --format '{{.Server.Version}}'  # 27 or later (IPv6, section 3)
    ```
 5. Optional but recommended: a non-root login for day-to-day use.
    ```sh
@@ -103,6 +115,41 @@ Check from the server: `dig +short homedeliveryclaims.com` and
 `dig +short www.homedeliveryclaims.com` should print the new address. Caddy
 requests HTTPS certificates automatically once this resolves and ports 80/443 are
 open. You can raise the TTL to 3600 after launch.
+
+**IPv6.** The AAAA record works because `deploy/docker-compose.yml` turns IPv6 on
+for the service's Docker network, so Docker hands each IPv6 visitor to Caddy with
+their own address, just as with IPv4. That needs Docker Engine 27 or later
+(step 2.4), and section 8 has a check. Without it, Docker relays IPv6 connections
+itself and every IPv6 visitor (most phones in the US) arrives as one internal
+address, so they all share one set of rate limits: five login-code requests in 15
+minutes from anyone on IPv6 would block the rest, and ten wrong admin passwords
+would lock every IPv6 admin out. If the check fails and Docker can't be upgraded,
+delete the AAAA record instead; IPv4 alone works for everyone.
+
+Client addresses can't be faked either: Caddy ignores any `X-Forwarded-For` a
+visitor sends and passes on the real one, and the app accepts that header only
+because nothing but Caddy can reach it (its port is never published). Keep it
+that way: don't publish port 3000 or set `trusted_proxies` in the Caddyfile.
+
+**Email for the main domain.** The site tells claimants to write to
+`claims@homedeliveryclaims.com`, so the domain needs working mail before launch.
+In your email provider, add the domain, create the `claims@` and `integration@`
+mailboxes (and a `dmarc@` alias for the reports below), then add the records the
+provider shows:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| MX | `@` | the provider's mail servers |
+| TXT | `@` | SPF, e.g. `v=spf1 include:_spf.google.com ~all` (the provider's include) |
+| TXT or CNAME | the provider's DKIM name, e.g. `google._domainkey` | the DKIM key the provider generates; then turn DKIM signing on |
+| TXT | `_dmarc` | `v=DMARC1; p=none; rua=mailto:dmarc@homedeliveryclaims.com` |
+
+There can be only one SPF record per name: if `@` already has a `v=spf1` TXT
+record, add the include to it. The DMARC record also covers the HighLevel
+sending subdomain from step 6.3; once its reports show your mail passing, you can
+change `p=none` to `p=quarantine`. Test: from a personal address, write to
+`claims@homedeliveryclaims.com`, then reply from the mailbox. Both messages should
+arrive, and not in spam.
 
 The HighLevel sending domain adds more records in step 6.3.
 
@@ -255,6 +302,11 @@ Form settings:
 - After submission: message "Thank you. Check your email for your claim number
   and a private link to follow your claim." Don't allow editing or viewing the
   submission.
+- Design: turn on **hide monday branding** (the form's design/customize panel;
+  Pro or higher, on some accounts Enterprise). The site never names Monday to
+  claimants. Monday doesn't always carry this setting into embedded forms, so
+  check `/start-a-claim` on a phone and a computer once the site is up (launch
+  checklist).
 - Test uploads from an iPhone (HEIC photos, MOV video) and a large file before
   launch: Monday's form upload accepts fewer types than the claim page does.
 
@@ -271,14 +323,20 @@ number and a reference code filled in.
 2. Columns:
    - Claim number (Text)
    - Reference (Text) (the signature that proves the link came from us)
-   - Verification (Status) with labels **Verified** and **Check claim number**
+   - Verification (Status) with labels **Verified**, **Check claim number** and
+     **Duplicate submission**
    - Payment method (Status or Dropdown: Check / Direct deposit), then the
      bank and mailing-address columns finance needs.
    Restrict viewing of the bank columns to finance (column permissions).
 3. **Decide whether the integration may verify submissions.** If yes (recommended),
    invite the integration user to this board. The service then reads only the
    Claim number and Reference columns of new items, sets Verification to
-   "Verified" or "Check claim number", and marks the claim's payment step done.
+   "Verified", "Check claim number" (the link isn't the claim's current one, e.g.
+   from before **Replace the claim link**) or "Duplicate submission" (the claim
+   already has verified payment details: an update on the claim names both
+   items), and marks the claim's payment step done. If the two columns are
+   still empty when it first looks, it looks again over about five minutes
+   before flagging the item.
    If finance prefers the integration to have no access at all, leave
    `paymentBoard` out of `board.json`; finance then checks claim numbers by hand.
 4. Add a form view. Questions:
@@ -292,7 +350,8 @@ number and a reference code filled in.
    titles or column ids. Use Short text for both: other question types don't
    pre-fill reliably.
 5. Form settings: require login off, reCAPTCHA on, no editing or viewing of the
-   submission afterwards.
+   submission afterwards, and **hide monday branding** in the design panel (as
+   in 5.4).
 6. **Share form > Copy link** -> `paymentForm.url`. The parameter names ->
    `paymentForm.claimNumberParam` (`claim`) and `paymentForm.signatureParam` (`ref`).
    Board id and the three column ids -> `paymentBoard`.
@@ -341,9 +400,8 @@ missing.
 
 **Settings > Email Services** (LC Email): add a dedicated sending domain such as
 `mail.homedeliveryclaims.com`, add the DNS records HighLevel shows (SPF, DKIM,
-and its tracking/return-path records), and wait for it to verify. Also publish a
-DMARC record for the main domain if there isn't one, e.g.
-`_dmarc  TXT  "v=DMARC1; p=none; rua=mailto:dmarc@homedeliveryclaims.com"`.
+and its tracking/return-path records), and wait for it to verify. The DMARC
+record for the main domain (section 3) covers this subdomain too.
 
 - `HIGHLEVEL_EMAIL_FROM`: an address on that domain, e.g.
   `claims@mail.homedeliveryclaims.com`. Replies come back into HighLevel
@@ -441,6 +499,17 @@ Check in a browser: https://homedeliveryclaims.com (padlock shown),
 https://www.homedeliveryclaims.com redirects to it, and
 https://homedeliveryclaims.com/admin asks for the admin user and password.
 
+Check that IPv6 visitors keep their own address (section 3):
+
+```sh
+docker network inspect hdc_default --format '{{.EnableIPv6}}'    # true
+sudo ip6tables -t nat -S DOCKER | grep -- '--dport 443'           # a DNAT rule to Caddy
+```
+
+If the first prints `false` or the second prints nothing, upgrade Docker
+(step 2.4) and run `docker compose down && docker compose up -d`, or delete the
+AAAA record.
+
 Then check the Monday configuration and register the webhooks:
 
 ```sh
@@ -450,10 +519,12 @@ docker compose exec app node dist/scripts/monday-setup.js webhooks
 
 `check` must end with "All checks passed" (fix `board.json` and
 `docker compose restart app` until it does). `webhooks` registers: new items,
-status changes, the claimant-visible file columns and updates on the claims board,
-plus new items on the payment board. It is safe to re-run, and must be re-run
-after changing `WEBHOOK_SECRET`, `PUBLIC_BASE_URL`, the status column or the file
-columns in `board.json`. The ids it creates are kept in the data volume.
+status changes, the claimant-visible file columns, the email and phone columns
+(so a corrected address reaches the claim page and HighLevel straight away) and
+updates on the claims board, plus new items on the payment board. It is safe to
+re-run, and must be re-run after changing `WEBHOOK_SECRET`, `PUBLIC_BASE_URL`, the
+status, email or phone column or the file columns in `board.json`. The ids it
+creates are kept in the data volume.
 
 And the HighLevel check (should end "All checks passed"):
 
@@ -616,6 +687,14 @@ text, and texting STATUS should get a reply.
       in. They live in `src/web/site-info.ts`; ask the developer to update and
       redeploy.
 - [ ] `monday-setup.js check` and `highlevel-setup.js check` both pass.
+- [ ] `claims@homedeliveryclaims.com` receives mail sent from outside (section 3)
+      and someone reads it every working day. (To show a different address on
+      the site, ask the developer to change `contactEmail` in
+      `src/web/site-info.ts`.)
+- [ ] No monday.com logo or "Powered by monday" on `/start-a-claim` (check on a
+      phone and a computer) or on the payment form (open it from a test claim
+      page). Hidden branding doesn't always carry over to embedded forms.
+- [ ] The IPv6 check in section 8 passes (or the AAAA record is deleted).
 - [ ] **End-to-end test claim** with your own email and phone:
   - [ ] Submit the form on `/start-a-claim` with a photo and the text box ticked.
   - [ ] Confirmation email arrives; the Monday item gets its claim number, date and
@@ -625,6 +704,7 @@ text, and texting STATUS should get a reply.
   - [ ] Send a message and upload a file on the claim page: an update and the file
         appear on the Monday item; the people in `notifyUserIds` get a
         notification.
+  - [ ] Upload 8 or more phone photos in one go: all of them appear.
   - [ ] Post `To claimant: hello` on the item: the email arrives and the message
         shows on the claim page.
   - [ ] Reply to that email: it appears on the item.
@@ -643,7 +723,8 @@ text, and texting STATUS should get a reply.
   - [ ] (Once SMS is on) Text STATUS, then STOP: status reply, then email only.
   - [ ] **/admin** shows no failed jobs.
 - [ ] **Backups** scheduled (section 12) and one restore tried on a scratch
-      server.
+      server with the worker off and dummy tokens (section 12, "Trying a
+      restore").
 - [ ] An **uptime monitor** (e.g. UptimeRobot, Better Stack) checks
       `https://homedeliveryclaims.com/healthz` every few minutes and alerts you.
 - [ ] Admin password, `.env` and the webhook URL are in the password manager and
@@ -662,6 +743,14 @@ went wrong (e.g. a Monday column renamed, HighLevel token expired). Fix the caus
 then press **Retry**; jobs are safe to run again. Failed calls to Monday or
 HighLevel retry by themselves for about two hours before they show up here.
 
+If the account uses up Monday's daily API allowance, jobs that need Monday wait
+(as pending, not failed) until a few minutes after midnight UTC, when it resets,
+and then run. Rate limits that name a wait time are handled the same way.
+
+Finished jobs are deleted after 7 days (their contents can include Monday
+update text and claimant messages) and webhook delivery records after 90 days.
+Failed jobs stay until retried.
+
 ### Logs
 
 ```sh
@@ -670,8 +759,9 @@ docker compose logs --since 2h app      # the last two hours
 docker compose logs --since 2h caddy    # HTTPS / certificate problems
 ```
 
-Logs never contain message text, codes or bank details. Request lines do contain
-URLs, which can include claim links and the webhook secret: don't paste raw logs
+Logs never contain message text, codes or bank details, and claim links and
+the webhook secret are cut out of URLs (by the app and by Caddy's log filter).
+They do contain claim numbers and Monday item ids, so still don't paste raw logs
 into tickets or chat. Logs rotate automatically (about 100 MB kept).
 
 ### Backups
@@ -680,44 +770,119 @@ Everything the service owns is in the `hdc_data` Docker volume: the SQLite
 database (claim numbers, messages, edited templates, the job queue), cached claim
 files and the Monday webhook ids. Monday and HighLevel keep their own data.
 
+The app makes the backup itself (`scripts/backup.ts`): a consistent copy of the
+live database (safe while the app runs) plus everything else in the volume, as
+one `.tar.gz`. It runs inside the container as the app's own user and writes
+the archive to its output, which the host saves; so no folder needs special
+ownership, and the archive gets the host's permissions.
+
 Create `/opt/hdc-backup.sh`:
 
 ```sh
 #!/bin/sh
-# Nightly backup of the hdc_data volume to /opt/hdc-backups, keeping 30 days.
+# Nightly backup of the service's data to /opt/hdc-backups, keeping 30 days.
 set -eu
-STAMP=$(date +%Y%m%d-%H%M%S)
+umask 077    # archives hold personal data: readable by root only
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+OUT=/opt/hdc-backups/hdc-$STAMP.tar.gz
 mkdir -p /opt/hdc-backups
 cd /opt/hdc/deploy
-# A consistent copy of the live database (safe while the app runs).
-docker compose exec -T app node -e "const D=require('better-sqlite3');new D('/data/hdc.sqlite').backup('/data/hdc-backup.sqlite').then(()=>process.exit(0),(e)=>{console.error(e.message);process.exit(1)})"
-# Database copy + cached files + webhook ids, without the live database files.
-docker run --rm -v hdc_data:/data:ro -v /opt/hdc-backups:/backup --entrypoint tar hdc-app:latest \
-  czf "/backup/hdc-$STAMP.tar.gz" -C /data --exclude='hdc.sqlite*' .
+if ! docker compose exec -T app node dist/scripts/backup.js --out - > "$OUT.part" \
+   || ! tar -tzf "$OUT.part" > /dev/null; then
+  rm -f "$OUT.part"
+  echo "$(date): backup FAILED" >&2
+  exit 1
+fi
+mv "$OUT.part" "$OUT"
 find /opt/hdc-backups -name 'hdc-*.tar.gz' -mtime +30 -delete
+echo "$(date): backup written to $OUT"
 ```
 
 ```sh
 sudo chmod 700 /opt/hdc-backup.sh
-sudo /opt/hdc-backup.sh && ls -lh /opt/hdc-backups      # try it once
+sudo /opt/hdc-backup.sh && sudo ls -lh /opt/hdc-backups     # try it once
 sudo crontab -e      # add the line:  30 3 * * * /opt/hdc-backup.sh >> /var/log/hdc-backup.log 2>&1
 ```
 
-The archives contain personal data: keep a copy **off the server** (e.g. a
-Hetzner Storage Box with `rsync`, or encrypted with `restic`/`rclone`), and limit
-who can read them.
+Check `/var/log/hdc-backup.log` now and then: it ends with "backup written" when
+all is well. The archives contain personal data: keep a copy **off the server**
+(e.g. a Hetzner Storage Box with `rsync`, or encrypted with `restic`/`rclone`),
+and limit who can read them.
 
-**Restore** (onto this or a new server with the same `.env` and `board.json`):
+Run without `--out -`, the script writes the archive into the data volume
+instead (`/data/backups`, which the app's user can write; later backups leave it
+out). The nightly script doesn't use that.
+
+### Restoring a backup
+
+On this server, or a new one prepared as in sections 2 to 4 with the same
+`.env` and `board.json` (keep the same `APP_SECRET`, or every claim link already
+sent stops working):
 
 ```sh
 cd /opt/hdc/deploy
 docker compose stop app
-docker run --rm -v hdc_data:/data -v /opt/hdc-backups:/backup --entrypoint sh --user root hdc-app:latest -c \
-  "cd /data && rm -f hdc.sqlite hdc.sqlite-wal hdc.sqlite-shm && tar xzf /backup/hdc-YYYYMMDD-HHMMSS.tar.gz && mv hdc-backup.sqlite hdc.sqlite && chown -R node:node /data"
+# Empty the data volume and unpack the archive into it, as the app's user.
+docker compose run --rm --no-deps -T app sh -c 'cd /data && find . -mindepth 1 -delete && tar -xzf -' \
+  < /opt/hdc-backups/hdc-YYYYMMDD-HHMMSS.tar.gz
+docker compose run --rm --no-deps app node dist/scripts/backup.js --check
+```
+
+`--check` prints "Integrity: ok", the number of claims and the highest claim
+number in the backup. **Before starting the app**, find the highest claim number
+on the board (sort the Claim number column from high to low). If it is higher
+than the backup's, claims were created after the backup was taken, and without
+the next step new claims would get numbers already emailed to those claimants.
+Move the sequence to the board's highest number (it never moves backwards, so
+this is safe to run either way), then start everything:
+
+```sh
+docker compose run --rm --no-deps app node dist/scripts/backup.js --bump-sequence HDC-001234
 docker compose up -d
 ```
 
-Keep the same `APP_SECRET`, or every claim link already sent stops working.
+After the restore:
+
+- Claim pages show each claim as it was when the backup was taken; changes made
+  on the board since then appear when that item next changes.
+- Claims created after the backup aren't in the restored copy, so their claim
+  links don't open. The service takes such an item in again the next time its
+  status changes (or a "To claimant:" update is posted on it). It keeps the
+  claim number already on the item, so the claimant's number and claim link stay
+  the same, but the claimant is sent the "New claim confirmation" again. That is
+  why the sequence must be moved first: an item whose number was meanwhile given
+  to a new claim would get a new number instead.
+- A claim link replaced (**Replace the claim link**) after the backup was taken
+  works again, because the restored copy has the older link. Replace it again
+  for any claim where that matters.
+
+### Trying a restore (scratch server)
+
+Do this once before launch and after big changes, on a separate server (or any
+machine with Docker), never on production. The copy must not act on the live
+board or message claimants, so it runs with the worker off and with tokens that
+don't work:
+
+1. Get the code and build the image (section 4), and copy `config/board.json`
+   from production.
+2. Create `.env` from production's, with these lines changed:
+   ```
+   WORKER_ENABLED=false
+   MONDAY_API_TOKEN=restore-test
+   HIGHLEVEL_API_TOKEN=restore-test
+   ```
+   `WORKER_ENABLED=false` keeps the copy from running the jobs that were queued
+   in the backup or the 15-minute settlement check; the dummy tokens stop anything
+   else from reaching Monday or HighLevel.
+3. Copy an archive over (e.g. `scp`) and run the three restore commands above
+   (`docker compose stop app` has nothing to stop the first time; that's fine).
+   `--check` must print "Integrity: ok" and about as many claims as /admin shows
+   on production.
+4. Start the app alone (no Caddy: the domain points at production):
+   `docker compose up -d app`. `docker compose ps` should show it healthy, and
+   `docker compose logs app` should say "WORKER_ENABLED=false".
+5. Delete the scratch server or the copied data and archive: they hold personal
+   data.
 
 ### Updating to a new version
 
@@ -730,20 +895,53 @@ docker compose ps                 # wait for "healthy"
 docker image prune -f             # remove old images
 ```
 
-The restart takes a few seconds. Webhooks that arrive meanwhile are retried by
-Monday and HighLevel, and queued jobs survive restarts. Take a backup first if
-the release notes mention a database change.
+The restart takes a few seconds: the app first finishes the job it is running
+(up to 25 seconds) so nothing is sent twice. Webhooks that arrive meanwhile are
+retried by Monday and HighLevel, and queued jobs survive restarts. Take a backup
+first (`sudo /opt/hdc-backup.sh`) if the release notes mention a database change.
+
+If `docker compose up` says the network `hdc_default` needs to be recreated (the
+first update after IPv6 was turned on), run `docker compose down`, then
+`docker compose up -d --build` again. The data volume is kept.
+
+After updating, run `docker compose exec app node dist/scripts/monday-setup.js webhooks`
+once (it only adds what is missing): new versions can listen to more columns,
+such as the email and phone columns.
+
+### Board size: archive finished claims
+
+Every claim is one item on the claims board, and a board holds at most 10,000
+items on Pro (100,000 on Enterprise); when it is full, the claim form can't
+create new claims. Once a month:
+
+- Look at the board's item count (each group shows how many items it has).
+- Archive claims that are finished (Closed or Denied) and haven't changed for a
+  couple of months: filter the board on those statuses and on the last update,
+  select the items, **Archive**. Monday's help ("item limit") says whether
+  archived items still count toward the limit on your plan; if they do, move
+  finished claims to a separate archive board instead.
+
+What a claimant sees for an archived or moved claim: the claim page keeps
+working from the service's cache. It still shows the status, messages and files
+the claim had, the claimant can still sign in, and the files the service already
+cached still open. But nothing about the item changes the page any more: its
+status stays as it was, and new files or `To claimant:` updates aren't picked up
+(archived items can't be edited, and the service only watches the claims board).
+If the claimant writes on the claim page or replies to an email or text, that is
+still stored, but posting it to the item may fail and show under /admin > Jobs;
+restore the item (or move it back), then press **Retry**.
 
 ### Common changes
 
 - **Message wording**: /admin > Messages. Preview, then Save. "Reset to default"
   restores the original. Takes effect at once.
 - **board.json changes** (new status label, new shared Files column): edit, then
-  `docker compose restart app`. If you changed the status column or any Files
-  column, also run `docker compose exec app node dist/scripts/monday-setup.js webhooks`.
+  `docker compose restart app`. If you changed the status, email or phone column
+  or any Files column, also run `docker compose exec app node dist/scripts/monday-setup.js webhooks`.
 - **A claim link reached the wrong person**: /admin > Claims, look up the claim,
-  **Replace the claim link** (the old link and every signed-in browser stop
-  working), then **Email the claimant their claim link**.
+  **Replace the claim link** (the old link, every signed-in browser and any
+  payment form link already sent stop working), then **Email the claimant their
+  claim link**.
 - **Admin password**: generate a new hash (step 4), replace it in `.env` (single
   quotes), `docker compose up -d`.
 - **Webhook secret leaked**: new `WEBHOOK_SECRET` in `.env`, `docker compose up -d`,

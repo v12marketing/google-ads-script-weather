@@ -56,10 +56,14 @@ const BoardConfigSchema = z.object({
       boardId: z.string(),
       claimNumberColumn: z.string(),
       signatureColumn: z.string(),
-      // Status column the integration sets to verifiedLabel / mismatchLabel.
+      // Status column the integration sets to verifiedLabel / mismatchLabel /
+      // duplicateLabel. Every label must already exist on the column.
       verificationColumn: z.string(),
       verifiedLabel: z.string().default('Verified'),
       mismatchLabel: z.string().default('Check claim number'),
+      // A verified submission for a claim whose payment details were already
+      // received (the form was filled in twice, or the link reached someone else).
+      duplicateLabel: z.string().default('Duplicate submission'),
     })
     .optional(),
   // An update on the item that starts with this prefix is sent to the claimant.

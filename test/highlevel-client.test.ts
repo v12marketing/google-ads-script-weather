@@ -134,10 +134,12 @@ describe('HighLevelClient contacts', () => {
   it('upserts with mapped custom fields, then adds tags separately; field ids load once', async () => {
     const { hl, calls } = client({
       [FIELDS_PATH]: fields,
-      'POST /contacts/upsert': () => ({ json: { new: true, contact: { id: 'contact_9' }, traceId: 't' } }),
+      'POST /contacts/upsert': () => ({
+        json: { new: true, contact: { id: 'contact_9', email: 'jane@example.com', emailLowerCase: 'jane@example.com', phone: '+16035550100' }, traceId: 't' },
+      }),
       'POST /contacts/contact_9/tags': () => ({ json: {} }),
     });
-    const id = await hl.upsertContact({
+    const contact = await hl.upsertContact({
       name: 'Jane Q Doe',
       firstName: 'Jane',
       email: 'jane@example.com',
@@ -146,7 +148,7 @@ describe('HighLevelClient contacts', () => {
       tags: ['hdc-claimant'],
       customFields: { claim_number: 'HDC-000123', portal_url: 'https://claims.test/c/tok' },
     });
-    expect(id).toBe('contact_9');
+    expect(contact).toEqual({ id: 'contact_9', email: 'jane@example.com', phone: '+16035550100' });
     await hl.upsertContact({ name: 'Jane Q Doe', firstName: 'Jane', email: 'jane@example.com', phone: null, smsOptIn: false, customFields: { claim_number: 'HDC-000124' } });
 
     expect(calls.filter((c) => c.path === `/locations/${LOC}/customFields`)).toHaveLength(1);
@@ -177,10 +179,55 @@ describe('HighLevelClient contacts', () => {
   });
 
   it('upserts without custom fields without loading them', async () => {
-    const { hl, calls } = client({ 'POST /contacts/upsert': () => ({ json: { contact: { id: 'c2' } } }) });
-    expect(await hl.upsertContact({ name: 'Bo', firstName: 'Bo', email: null, phone: '+447700900123', smsOptIn: false })).toBe('c2');
+    const { hl, calls } = client({ 'POST /contacts/upsert': () => ({ json: { contact: { id: 'c2', email: null, phone: '+447700900123' } } }) });
+    expect(await hl.upsertContact({ name: 'Bo', firstName: 'Bo', email: null, phone: '+447700900123', smsOptIn: false })).toEqual({
+      id: 'c2',
+      email: null,
+      phone: '+447700900123',
+    });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.body).toEqual({ locationId: LOC, name: 'Bo', firstName: 'Bo', phone: '+447700900123', source: 'HomeDeliveryClaims.com' });
+  });
+
+  it("reports the matched contact's own email and phone, which may not be the ones sent", async () => {
+    // HighLevel matched an existing contact on the phone: the email is someone else's.
+    const { hl } = client({
+      'POST /contacts/upsert': () => ({ json: { new: false, contact: { id: 'c7', email: 'Other@Example.com', phone: '+16035550100' } } }),
+    });
+    expect(await hl.upsertContact({ name: 'Mal', firstName: 'Mal', email: 'mal@example.com', phone: '+16035550100', smsOptIn: false })).toEqual({
+      id: 'c7',
+      email: 'Other@Example.com',
+      phone: '+16035550100',
+    });
+  });
+
+  it('reads the contact back when the upsert response leaves the email out', async () => {
+    const { hl, calls } = client({
+      'POST /contacts/upsert': () => ({ json: { contact: { id: 'c8' } } }),
+      'GET /contacts/c8': () => ({ json: { contact: { id: 'c8', email: 'jane@example.com', phone: '+16035550100' } } }),
+    });
+    expect(await hl.upsertContact({ name: 'Jane', firstName: 'Jane', email: 'jane@example.com', phone: null, smsOptIn: false })).toEqual({
+      id: 'c8',
+      email: 'jane@example.com',
+      phone: '+16035550100',
+    });
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual(['POST /contacts/upsert', 'GET /contacts/c8']);
+    expect(calls[1]!.headers.get('version')).toBe('2021-07-28');
+  });
+
+  it('gets a contact, or null once it is gone', async () => {
+    const { hl } = client({
+      'GET /contacts/c1': [
+        () => ({ json: { contact: { id: 'c1', emailLowerCase: 'jane@example.com', phone: null } } }),
+        () => ({ status: 404, json: { message: 'Contact not found' } }),
+        () => ({ status: 400, json: { message: 'Contact not found' } }),
+        () => ({ status: 500, json: { message: 'oops' } }),
+      ],
+    });
+    expect(await hl.getContact('c1')).toEqual({ id: 'c1', email: 'jane@example.com', phone: null });
+    expect(await hl.getContact('c1')).toBeNull();
+    expect(await hl.getContact('c1')).toBeNull();
+    await expect(hl.getContact('c1')).rejects.toThrow(/HTTP 500/);
   });
 
   it('refuses a contact with no email or phone, and fails clearly without a contact id', async () => {
@@ -386,9 +433,16 @@ describe('HighLevelClient.verifySignedDocument', () => {
 
   it('signed: completed, every signer has signed, the contact among them', async () => {
     const { result, calls } = await verify([other(1), signedDoc()]);
-    expect(result).toEqual({ signed: true, reason: null, signedAt: '2026-10-20T15:04:05.000Z', signerIp: '203.0.113.9', documentName: 'Settlement Agreement' });
+    expect(result).toEqual({
+      signed: true,
+      reason: null,
+      signedAt: '2026-10-20T15:04:05.000Z',
+      signerIp: '203.0.113.9',
+      documentName: 'Settlement Agreement',
+      signUrl: null,
+    });
     expect(calls[0]!.query.get('locationId')).toBe(LOC);
-    expect(calls[0]!.query.get('status')).toBe('completed');
+    expect(calls[0]!.query.get('status')).toBe('draft,sent,viewed,completed,accepted');
     expect(calls[0]!.headers.get('version')).toBe('2021-07-28');
   });
 
@@ -443,11 +497,113 @@ describe('HighLevelClient.verifySignedDocument', () => {
     const sent = signedDoc({ status: 'sent', recipients: [{ id: 'contact_1', role: 'signer', hasCompleted: false }] });
     const r1 = await verify([sent]);
     expect(r1.result).toMatchObject({ signed: false, reason: 'not_completed' });
-    expect(r1.calls.map((c) => c.query.get('status'))).toEqual(['completed', 'draft,sent,viewed,accepted']);
+    // One pass over every status, not the completed list first.
+    expect(r1.calls.map((c) => c.query.get('status'))).toEqual(['draft,sent,viewed,completed,accepted']);
     expect((await verify([other(1)])).result).toMatchObject({ signed: false, reason: 'not_found' });
     const none = await verify([signedDoc()], { documentId: null, referenceId: null });
     expect(none.result).toMatchObject({ signed: false, reason: 'not_found' });
     expect(none.calls).toHaveLength(0);
+  });
+
+  it('narrows the list to a window around the send time and stops paging at the match (#21)', async () => {
+    const sentAt = '2026-10-20T15:00:00.000Z';
+    const { hl, calls } = client({
+      // Thousands of documents in the location; the match is on the first page.
+      'GET /proposals/document': () => ({ json: { documents: [other(1), signedDoc()], total: 5000 } }),
+    });
+    const before = Date.now();
+    expect((await hl.verifySignedDocument(ref, 'contact_1', { sentAt })).signed).toBe(true);
+    expect(calls).toHaveLength(1);
+    const q = calls[0]!.query;
+    expect(q.get('status')).toBe('draft,sent,viewed,completed,accepted');
+    expect(q.get('dateFrom')).toBe('2026-10-19T15:00:00.000Z');
+    const dateTo = Date.parse(q.get('dateTo')!);
+    expect(dateTo).toBeGreaterThanOrEqual(before + 24 * 60 * 60 * 1000);
+    expect(dateTo).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60 * 1000);
+  });
+
+  it('scans without the window if HighLevel rejects it, and then stops sending it', async () => {
+    const { hl, calls } = client({
+      'GET /proposals/document': (c) =>
+        c.query.has('dateFrom') ? { status: 422, json: { message: 'dateFrom must be a date' } } : { json: { documents: [signedDoc()], total: 1 } },
+    });
+    const sentAt = '2026-10-20T15:00:00.000Z';
+    expect((await hl.verifySignedDocument(ref, 'contact_1', { sentAt })).signed).toBe(true);
+    expect((await hl.verifySignedDocument(ref, 'contact_1', { sentAt })).signed).toBe(true);
+    expect(calls.map((c) => c.query.has('dateFrom'))).toEqual([true, false, false]);
+  });
+
+  it("returns the contact's https signing link (shareLink) for the claim page (#10)", async () => {
+    const sent = (shareLink: unknown) =>
+      signedDoc({ status: 'sent', recipients: [{ id: 'contact_1', role: 'signer', hasCompleted: false, shareLink }, { id: 'user_hl', shareLink: 'https://x.test/u' }] });
+    expect((await verify([sent('https://link.example.com/documents/v1/abc')])).result).toMatchObject({
+      reason: 'not_completed',
+      signUrl: 'https://link.example.com/documents/v1/abc',
+    });
+    expect((await verify([sent('javascript:alert(1)')])).result.signUrl).toBeNull();
+    expect((await verify([sent('http://link.example.com/d')])).result.signUrl).toBeNull();
+    expect((await verify([sent(undefined)])).result.signUrl).toBeNull();
+  });
+});
+
+describe('HighLevelClient.findSentDocuments (#17, #20, #32)', () => {
+  const since = '2026-10-20T15:00:00.000Z';
+  const doc = (id: string, over: Record<string, unknown> = {}) => ({
+    _id: `hex-${id}`,
+    documentId: `uuid-${id}`,
+    status: 'sent',
+    createdAt: '2026-10-20T15:00:20.000Z',
+    recipients: [{ id: 'contact_1', role: 'signer', shareLink: `https://link.example.com/${id}` }],
+    links: [{ documentId: `uuid-${id}`, referenceId: `ref-${id}` }],
+    ...over,
+  });
+
+  it('finds documents sent to the contact since the attempt, oldest first, skipping known ones', async () => {
+    const pages = [
+      { documents: [doc('later', { createdAt: '2026-10-20T15:09:00.000Z' }), doc('other-contact', { recipients: [{ id: 'contact_2' }] })], total: 5 },
+      { documents: [doc('first'), doc('before', { createdAt: '2026-10-20T14:00:00.000Z' }), doc('known')], total: 5 },
+    ];
+    const { hl, calls } = client({ 'GET /proposals/document': [() => ({ json: pages[0] }), () => ({ json: pages[1] })] });
+    const found = await hl.findSentDocuments('contact_1', since, [{ documentId: null, referenceId: 'ref-known' }]);
+    expect(found).toEqual([
+      { documentId: 'uuid-first', referenceId: 'hex-first', createdAt: '2026-10-20T15:00:20.000Z', signUrl: 'https://link.example.com/first' },
+      { documentId: 'uuid-later', referenceId: 'hex-later', createdAt: '2026-10-20T15:09:00.000Z', signUrl: 'https://link.example.com/later' },
+    ]);
+    expect(calls[0]!.query.get('status')).toBe('draft,sent,viewed,completed,accepted');
+    expect(calls[0]!.query.get('dateFrom')).toBe('2026-10-19T15:00:00.000Z');
+    expect(calls[0]!.query.get('dateTo')).not.toBeNull();
+    // Whatever HighLevel adds: the ids it returns match the document when verifying.
+    const v = client({ 'GET /proposals/document': () => ({ json: { documents: [doc('first')], total: 1 } }) });
+    expect((await v.hl.verifySignedDocument(found[0]!, 'contact_1')).reason).toBe('not_completed');
+  });
+
+  it('allows for a little clock skew, and returns nothing when there is no such document', async () => {
+    const skewed = doc('skewed', { createdAt: '2026-10-20T14:59:30.000Z' });
+    const earlier = doc('earlier', { createdAt: '2026-10-20T14:57:00.000Z' });
+    const a = client({ 'GET /proposals/document': () => ({ json: { documents: [earlier, skewed], total: 2 } }) });
+    expect((await a.hl.findSentDocuments('contact_1', since)).map((d) => d.documentId)).toEqual(['uuid-skewed']);
+    const b = client({ 'GET /proposals/document': () => ({ json: { documents: [], total: 0 } }) });
+    expect(await b.hl.findSentDocuments('contact_1', since)).toEqual([]);
+  });
+});
+
+describe('HighLevelClient settlement send is never retried by the client (#20)', () => {
+  it('a 5xx on POST /proposals/templates/send is reported once, without a second POST', async () => {
+    const saved = new Map<string, string>();
+    const { hl, calls } = client({
+      [FIELDS_PATH]: fields,
+      'PUT /contacts/contact_1': (c: Call) => {
+        for (const f of c.body.customFields) saved.set(f.id, f.field_value);
+        return { json: {} };
+      },
+      'GET /contacts/contact_1': () => ({ json: { contact: { id: 'contact_1', customFields: [...saved].map(([id, value]) => ({ id, value })) } } }),
+      'POST /proposals/templates/send': () => ({ status: 502, json: { message: 'Bad gateway' } }),
+    });
+    const req = { contactId: 'contact_1', claimNumber: 'HDC-000123', itemId: '42', settlementAmount: 900, claimantName: 'Jane Doe', portalUrl: 'https://claims.test/c/tok' };
+    const err = (await hl.requestSettlementSignature(req).catch((e) => e)) as HighLevelApiError;
+    expect(err).toBeInstanceOf(HighLevelApiError);
+    expect(err.status).toBe(502);
+    expect(calls.filter((c) => c.path === '/proposals/templates/send')).toHaveLength(1);
   });
 });
 

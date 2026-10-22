@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { visibleFileColumns } from '../src/board-config.js';
 import type { Claim } from '../src/domain/types.js';
 import { JOB } from '../src/services/contracts.js';
-import { ClaimantInputError, MAX_SYNC_BYTES, safeFileName } from '../src/services/files.js';
+import {
+  ClaimantInputError,
+  MAX_CLAIMANT_BYTES_PER_CLAIM,
+  MAX_CLAIMANT_FILES_PER_CLAIM,
+  MAX_SYNC_BYTES,
+  safeFileName,
+} from '../src/services/files.js';
 import { addClaimItem, makeTestEnv, type TestEnv } from './helpers.js';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
@@ -215,6 +221,44 @@ describe('addClaimantUpload', () => {
     expect(env.store.files.size).toBe(0);
     expect(env.ctx.jobs.list()).toHaveLength(0);
   });
+
+  // A cached file row only (no bytes needed) to fill up a claim's allowance.
+  const fileRow = (env: TestEnv, itemId: string, i: number, sizeBytes: number, source: 'team' | 'claimant' = 'claimant') =>
+    env.ctx.repo.addFile({ itemId, source, columnId: null, mondayAssetId: null, name: `old-${i}.jpg`, mimeType: 'image/jpeg', sizeBytes, storageKey: `${itemId}/old-${i}` });
+
+  it('caps the number of files a claimant can add to one claim', async () => {
+    const env = makeTestEnv();
+    const claim = makeClaim(env);
+    const other = makeClaim(env);
+    const { files } = env.ctx.services;
+    for (let i = 0; i < MAX_CLAIMANT_FILES_PER_CLAIM - 1; i++) fileRow(env, claim.itemId, i, 1000);
+    for (let i = 0; i < 5; i++) fileRow(env, claim.itemId, 1000 + i, 1000, 'team'); // the team's files don't count
+
+    await files.addClaimantUpload(claim, upload('last.png', PNG));
+    const err = await rejection(files.addClaimantUpload(claim, upload('one-more.png', PNG)));
+    expect(err.message).toMatch(new RegExp(`already has ${MAX_CLAIMANT_FILES_PER_CLAIM} files`));
+    expect(err.message).toMatch(/send us a message/);
+
+    expect(env.ctx.repo.listFiles(claim.itemId).filter((f) => f.name === 'one-more.png')).toEqual([]);
+    expect(env.store.files.size).toBe(1);
+    expect(env.ctx.jobs.list().filter((j) => j.type === JOB.uploadToMonday)).toHaveLength(1);
+    // Another claim has its own allowance.
+    await expect(files.addClaimantUpload(other, upload('box.png', PNG))).resolves.toMatchObject({ itemId: other.itemId });
+  });
+
+  it('caps the total size of the files a claimant can add to one claim', async () => {
+    const env = makeTestEnv();
+    const claim = makeClaim(env);
+    const { files } = env.ctx.services;
+    fileRow(env, claim.itemId, 0, MAX_CLAIMANT_BYTES_PER_CLAIM - 2 * PNG.length);
+
+    await files.addClaimantUpload(claim, upload('fits.png', PNG));
+    await files.addClaimantUpload(claim, upload('fits-too.png', PNG)); // exactly the allowance
+    const err = await rejection(files.addClaimantUpload(claim, upload('over.png', PNG)));
+    expect(err.message).toMatch(/over 500 MB in total/);
+    expect(env.ctx.repo.listFiles(claim.itemId).map((f) => f.name)).toEqual(['old-0.jpg', 'fits.png', 'fits-too.png']);
+    expect(env.store.files.size).toBe(2);
+  });
 });
 
 describe('attachUploadToMonday', () => {
@@ -262,5 +306,72 @@ describe('attachUploadToMonday', () => {
     const attached = env.monday.mustItem(claim.itemId).columnValues[env.board.columns.claimantUploads]!.assetIds;
     expect(attached).toHaveLength(1);
     expect(env.monday.callsTo('createUpdate')).toHaveLength(1);
+  });
+
+  it('links an upload that landed despite a failed response, instead of attaching or mirroring a second copy', async () => {
+    const env = makeTestEnv();
+    const claim = makeClaim(env);
+    const { files } = env.ctx.services;
+    const f = await files.addClaimantUpload(claim, upload('damage.jpg', JPEG));
+
+    // /v2/file stores the file, then the response is lost (5xx or timeout).
+    const realUpload = env.monday.uploadFileToColumn.bind(env.monday);
+    let landed = '';
+    let loseResponse = true;
+    env.monday.uploadFileToColumn = async (itemId, columnId, file) => {
+      const id = await realUpload(itemId, columnId, file);
+      if (!loseResponse) return id;
+      landed = id;
+      throw new Error('Monday API returned 502 (it may still have been applied)');
+    };
+    await expect(files.attachUploadToMonday(f.id)).rejects.toThrow(/may still have been applied/);
+    loseResponse = false;
+
+    // The column-change webhook for the landed copy is handled before the job retries.
+    await files.syncFiles(claim.itemId);
+    expect(env.monday.callsTo('downloadAsset')).toHaveLength(0);
+    expect(env.ctx.repo.listFiles(claim.itemId).map((x) => [x.id, x.mondayAssetId])).toEqual([[f.id, null]]);
+
+    await files.attachUploadToMonday(f.id);
+
+    expect(env.monday.callsTo('uploadFileToColumn')).toHaveLength(1);
+    expect(env.monday.mustItem(claim.itemId).columnValues[env.board.columns.claimantUploads]!.assetIds).toEqual([landed]);
+    expect(env.ctx.repo.getFile(f.id)).toMatchObject({ mondayAssetId: landed, columnId: env.board.columns.claimantUploads });
+    expect(env.monday.callsTo('createUpdate')).toHaveLength(1);
+    await files.syncFiles(claim.itemId);
+    expect(env.ctx.repo.listFiles(claim.itemId).map((x) => x.id)).toEqual([f.id]);
+  });
+
+  it("uploads again after a failure that didn't land, even when another copy of the same file is on the item", async () => {
+    const env = makeTestEnv();
+    const claim = makeClaim(env);
+    const { files } = env.ctx.services;
+    // The claimant added the same photo twice.
+    const a = await files.addClaimantUpload(claim, upload('same.jpg', JPEG));
+    const b = await files.addClaimantUpload(claim, upload('same.jpg', JPEG));
+    await files.attachUploadToMonday(a.id);
+
+    env.monday.failNext = 1;
+    await expect(files.attachUploadToMonday(b.id)).rejects.toThrow();
+    await files.syncFiles(claim.itemId);
+    await files.attachUploadToMonday(b.id);
+
+    const assets = env.monday.mustItem(claim.itemId).columnValues[env.board.columns.claimantUploads]!.assetIds!;
+    expect(assets).toHaveLength(2);
+    expect(assets).toEqual([env.ctx.repo.getFile(a.id)!.mondayAssetId, env.ctx.repo.getFile(b.id)!.mondayAssetId]);
+  });
+
+  it('still mirrors a team file in the claimant-uploads column that only shares a pending upload\'s name', async () => {
+    const env = makeTestEnv();
+    const claim = makeClaim(env);
+    const { files } = env.ctx.services;
+    const f = await files.addClaimantUpload(claim, upload('photo.jpg', JPEG));
+    env.monday.failNext = 1;
+    await expect(files.attachUploadToMonday(f.id)).rejects.toThrow(); // attempted, didn't land
+    const other = env.monday.attachFile(claim.itemId, env.board.columns.claimantUploads, upload('photo.jpg', Buffer.concat([JPEG, JPEG]), 'image/jpeg'));
+
+    await files.syncFiles(claim.itemId);
+
+    expect(env.ctx.repo.listFiles(claim.itemId).map((x) => x.mondayAssetId)).toEqual([null, other]);
   });
 });
