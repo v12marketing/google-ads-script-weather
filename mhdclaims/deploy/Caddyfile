@@ -1,0 +1,111 @@
+# Caddy in front of the app: HTTPS certificates (Let's Encrypt, automatic),
+# compression, request size limits, error pages and security headers.
+#
+# No access log on purpose: request URLs carry claimants' private claim links
+# (/c/<token>) and the webhook secret (/webhooks/<source>/<secret>). The log
+# filter below keeps them out of Caddy's other log lines too.
+#
+# Client addresses: Caddy is the only proxy, so it ignores any X-Forwarded-For a
+# client sends and gives the app the address the connection came from (no
+# trusted_proxies is set; don't add one). The app trusts that header from
+# Caddy, which is why its port is never published (docker-compose.yml). The
+# compose network has IPv6, so IPv6 visitors arrive with their own address
+# rather than Docker's gateway address (docs/SETUP.md section 3).
+{
+	# Optional: an address Let's Encrypt can email about certificate problems.
+	# email ops@homedeliveryclaims.com
+
+	# Caddy's own log lines (e.g. an error while the app restarts) can include the
+	# request; drop its URI and Referer, which can hold a claim link or the
+	# webhook secret.
+	log default {
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers>Referer delete
+			}
+		}
+	}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Defaults only: the app sets its own per page (e.g. the admin pages
+		# need a same-origin referrer policy for their forms).
+		?X-Content-Type-Options "nosniff"
+		?X-Frame-Options "DENY"
+		?Referrer-Policy "no-referrer"
+		?Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		-Server
+		-X-Powered-By
+	}
+}
+
+homedeliveryclaims.com {
+	import security_headers
+	encode zstd gzip
+
+	# Request size limits. One upload from the claim page may be up to 100 MiB
+	# in total (MAX_UPLOAD_REQUEST_BYTES in src/web/routes/portal.ts; the app
+	# explains anything over that itself), so the upload route allows a little
+	# more for the form encoding. Nothing else needs more than the app's 1 MiB.
+	@upload path /c/*/files
+	request_body @upload {
+		max_size 110MB
+	}
+	@not_upload not path /c/*/files
+	request_body @not_upload {
+		max_size 2MB
+	}
+
+	reverse_proxy app:3000
+
+	# Errors Caddy produces itself get a short page instead of an empty
+	# response (and, being handled, aren't logged at the default level).
+	handle_errors {
+		import security_headers
+		header Cache-Control "no-store"
+		header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'"
+
+		# An upload over the limit above (the parts before the cut may be saved).
+		@too_large expression `{err.status_code} == 413`
+		handle @too_large {
+			header Content-Type "text/html; charset=utf-8"
+			respond `<!doctype html>
+			<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+			<title>Upload too large - Home Delivery Claims</title></head>
+			<body style="font: 17px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; color: #1f2933">
+			<h1>That upload was too large</h1>
+			<p>One upload can be up to 100 MB in total. Some of your files may already have been added.</p>
+			<p>Use your browser's Back button to return to your claim page, check which files are listed there, and add the rest a few at a time.</p>
+			</body></html>
+			`
+		}
+
+		# The app is restarting (an update takes a few seconds).
+		@unavailable expression `{err.status_code} in [502, 503, 504]`
+		handle @unavailable {
+			header Content-Type "text/html; charset=utf-8"
+			header Retry-After "30"
+			respond `<!doctype html>
+			<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+			<title>Back in a moment - Home Delivery Claims</title></head>
+			<body style="font: 17px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; color: #1f2933">
+			<h1>Back in a moment</h1>
+			<p>We're updating the site. Please try again in a minute.</p>
+			</body></html>
+			`
+		}
+
+		handle {
+			respond "{err.status_code} {err.status_text}"
+		}
+	}
+}
+
+www.homedeliveryclaims.com {
+	import security_headers
+	redir https://homedeliveryclaims.com{uri} permanent
+}
