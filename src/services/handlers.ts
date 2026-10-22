@@ -9,8 +9,8 @@ export function registerJobHandlers(ctx: AppContext): void {
 
   jobs.register(JOB.mondayItemCreated, (p: { itemId: string }) => s.intake.handleItemCreated(p.itemId));
 
-  jobs.register(JOB.mondayStatusChanged, (p: { itemId: string; label: string | null }) =>
-    s.status.handleStatusChanged(p.itemId, p.label),
+  jobs.register(JOB.mondayStatusChanged, (p: { itemId: string; label: string | null; eventId?: string }) =>
+    s.status.handleStatusChanged(p.itemId, p.label, p.eventId),
   );
 
   jobs.register(JOB.mondayColumnChanged, async (p: { itemId: string; columnId: string }) => {
@@ -36,4 +36,10 @@ export function registerJobHandlers(ctx: AppContext): void {
   jobs.register(JOB.highlevelDocumentSigned, (p: Extract<HighLevelEvent, { kind: 'document_signed' }>) =>
     s.settlement.handleDocumentSigned(p),
   );
+
+  jobs.register(JOB.highlevelDocumentDeclined, (p: Extract<HighLevelEvent, { kind: 'document_declined' }>) =>
+    s.settlement.handleDocumentDeclined(p),
+  );
+
+  jobs.register(JOB.settlementReconcile, () => s.settlement.reconcilePending());
 }

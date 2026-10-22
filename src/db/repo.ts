@@ -23,6 +23,7 @@ interface ClaimRow {
   email: string | null;
   phone: string | null;
   sms_opt_in: number;
+  sms_opted_out: number;
   status_key: string | null;
   status_label: string | null;
   amount_claimed: number | null;
@@ -32,6 +33,8 @@ interface ClaimRow {
   token_hash: string;
   settlement_sent_at: string | null;
   settlement_document_id: string | null;
+  settlement_reference_id: string | null;
+  settlement_amount_sent: number | null;
   settlement_signed_at: string | null;
   payment_details_received_at: string | null;
   received_at: string;
@@ -46,6 +49,7 @@ const toClaim = (r: ClaimRow): Claim => ({
   email: r.email,
   phone: r.phone,
   smsOptIn: r.sms_opt_in === 1,
+  smsOptedOut: r.sms_opted_out === 1,
   statusKey: r.status_key as StatusKey | null,
   statusLabel: r.status_label,
   amountClaimed: r.amount_claimed,
@@ -53,6 +57,7 @@ const toClaim = (r: ClaimRow): Claim => ({
   highlevelContactId: r.highlevel_contact_id,
   tokenVersion: r.token_version,
   settlementSentAt: r.settlement_sent_at,
+  settlementAmountSent: r.settlement_amount_sent,
   settlementSignedAt: r.settlement_signed_at,
   paymentDetailsReceivedAt: r.payment_details_received_at,
   receivedAt: r.received_at,
@@ -78,6 +83,7 @@ export type ClaimPatch = Partial<{
   email: string | null;
   phone: string | null;
   smsOptIn: boolean;
+  smsOptedOut: boolean;
   statusKey: StatusKey | null;
   statusLabel: string | null;
   amountClaimed: number | null;
@@ -87,6 +93,8 @@ export type ClaimPatch = Partial<{
   tokenHash: string;
   settlementSentAt: string | null;
   settlementDocumentId: string | null;
+  settlementReferenceId: string | null;
+  settlementAmountSent: number | null;
   settlementSignedAt: string | null;
   paymentDetailsReceivedAt: string | null;
 }>;
@@ -97,6 +105,7 @@ const PATCH_COLUMNS: Record<keyof ClaimPatch, string> = {
   email: 'email',
   phone: 'phone',
   smsOptIn: 'sms_opt_in',
+  smsOptedOut: 'sms_opted_out',
   statusKey: 'status_key',
   statusLabel: 'status_label',
   amountClaimed: 'amount_claimed',
@@ -106,6 +115,8 @@ const PATCH_COLUMNS: Record<keyof ClaimPatch, string> = {
   tokenHash: 'token_hash',
   settlementSentAt: 'settlement_sent_at',
   settlementDocumentId: 'settlement_document_id',
+  settlementReferenceId: 'settlement_reference_id',
+  settlementAmountSent: 'settlement_amount_sent',
   settlementSignedAt: 'settlement_signed_at',
   paymentDetailsReceivedAt: 'payment_details_received_at',
 };
@@ -134,18 +145,26 @@ export class Repo {
     return r ? toClaim(r) : null;
   }
 
-  getSettlementDocumentId(itemId: string): string | null {
-    const r = this.db.prepare('SELECT settlement_document_id d FROM claims WHERE item_id = ?').get(itemId) as
-      | { d: string | null }
-      | undefined;
-    return r?.d ?? null;
+  getSettlementRefs(itemId: string): { documentId: string | null; referenceId: string | null } {
+    const r = this.db
+      .prepare('SELECT settlement_document_id d, settlement_reference_id r FROM claims WHERE item_id = ?')
+      .get(itemId) as { d: string | null; r: string | null } | undefined;
+    return { documentId: r?.d ?? null, referenceId: r?.r ?? null };
   }
 
   getClaimBySettlementDocument(documentId: string): Claim | null {
-    const r = this.db.prepare('SELECT * FROM claims WHERE settlement_document_id = ?').get(documentId) as
-      | ClaimRow
-      | undefined;
+    const r = this.db
+      .prepare('SELECT * FROM claims WHERE settlement_document_id = ? OR settlement_reference_id = ?')
+      .get(documentId, documentId) as ClaimRow | undefined;
     return r ? toClaim(r) : null;
+  }
+
+  // Settlement sent but not yet signed, for the reconciliation poller.
+  listClaimsAwaitingSignature(): Claim[] {
+    const rows = this.db
+      .prepare('SELECT * FROM claims WHERE settlement_sent_at IS NOT NULL AND settlement_signed_at IS NULL')
+      .all() as ClaimRow[];
+    return rows.map(toClaim);
   }
 
   // Most recently received first.

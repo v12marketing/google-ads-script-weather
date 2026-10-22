@@ -30,6 +30,9 @@ export const JOB = {
   paymentItemCreated: 'payment.item_created',
   highlevelInbound: 'highlevel.inbound_message',
   highlevelDocumentSigned: 'highlevel.document_signed',
+  highlevelDocumentDeclined: 'highlevel.document_declined',
+  // Every 15 minutes: re-check settlements sent but not signed, in case a webhook was missed.
+  settlementReconcile: 'settlement.reconcile',
   // Claimant wrote on the portal: post it to Monday and notify the team.
   portalMessageToMonday: 'claim.portal_message_to_monday',
   // Claimant uploaded on the portal: attach it to the Monday file column.
@@ -64,7 +67,9 @@ export interface NotifyResult {
 export interface Notifier {
   // Sends the template's email (and SMS if opted in, enabled, and the template
   // has SMS text) to the claimant. Ensures the HighLevel contact exists.
-  notify(claim: Claim, key: TemplateKey, extra?: Partial<TemplateVars>): Promise<NotifyResult>;
+  // Pass eventKey to make retries safe: a channel already sent for that key is
+  // skipped (recorded via repo.markEventProcessed after each successful send).
+  notify(claim: Claim, key: TemplateKey, extra?: Partial<TemplateVars>, opts?: { eventKey?: string }): Promise<NotifyResult>;
   // Sends one SMS outside the template system (STATUS replies).
   sendSms(claim: Claim, text: string): Promise<boolean>;
   // Creates/updates the HighLevel contact for the claim and stores its id.
@@ -79,16 +84,27 @@ export interface IntakeService {
 }
 
 export interface StatusService {
-  handleStatusChanged(itemId: string, label: string | null): Promise<void>;
+  // eventId (Monday triggerUuid) dedupes redeliveries while still allowing the
+  // same status to be set again later (e.g. a second "More info needed").
+  handleStatusChanged(itemId: string, label: string | null, eventId?: string): Promise<void>;
 }
 
 export interface SettlementService {
+  // Status moved to settlement_offered: send the document for e-signature.
   sendSettlement(claim: Claim): Promise<void>;
+  // Workflow webhook said a document completed: verify via the API, then mark the
+  // claim signed and move the board to the settlement-signed label.
   handleDocumentSigned(event: Extract<HighLevelEvent, { kind: 'document_signed' }>): Promise<void>;
+  handleDocumentDeclined(event: Extract<HighLevelEvent, { kind: 'document_declined' }>): Promise<void>;
+  reconcilePending(): Promise<void>;
 }
 
 export interface PaymentService {
+  // Payment WorkForm link pre-filled with the claim number and its HMAC signature.
   paymentFormUrl(claim: Claim): string;
+  paymentSignature(claimNumber: string): string;
+  // New item on the payment board: reads ONLY the claim-number and signature
+  // columns, labels the item verified/mismatch, and marks the claim's payment step.
   handlePaymentItemCreated(itemId: string): Promise<void>;
 }
 

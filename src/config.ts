@@ -19,11 +19,13 @@ const EnvSchema = z.object({
   WEBHOOK_SECRET: z.string().min(16),
 
   MONDAY_API_TOKEN: z.string().min(1),
-  MONDAY_API_VERSION: z.string().default('2025-04'),
+  MONDAY_API_VERSION: z.string().default('2026-10'),
   // Monday user id of the integration account. Updates it authors are ignored
   // so our own posts never echo back to the claimant.
   MONDAY_INTEGRATION_USER_ID: z.string().min(1),
-  // Optional signing secret used to verify Monday webhook JWTs when present.
+  // Optional signing secret used to verify Monday webhook JWTs. Only webhooks
+  // created with an app (OAuth) token are signed; with a personal token the
+  // secret URL path is the only check.
   MONDAY_SIGNING_SECRET: z.string().optional(),
 
   HIGHLEVEL_API_TOKEN: z.string().min(1),
@@ -31,6 +33,13 @@ const EnvSchema = z.object({
   HIGHLEVEL_API_VERSION: z.string().default('2021-07-28'),
   HIGHLEVEL_EMAIL_FROM: z.string().min(1),
   HIGHLEVEL_EMAIL_FROM_NAME: z.string().default('Home Delivery Claims'),
+  // Documents & Contracts template id for the settlement, and the HighLevel user
+  // the document is sent as.
+  HIGHLEVEL_SETTLEMENT_TEMPLATE_ID: z.string().min(1),
+  HIGHLEVEL_USER_ID: z.string().min(1),
+  // Ed25519 public key (SPKI PEM or base64 DER) for x-ghl-signature on marketplace
+  // webhooks. Workflow Webhook actions are unsigned and rely on the secret path.
+  HIGHLEVEL_WEBHOOK_PUBLIC_KEY: z.string().default('MCowBQYDK2VwAyEAi2HR1srL4o18O8BRa7gVJY7G7bupbN3H9AwJrHCDiOg='),
   // Off until A2P 10DLC registration clears; email still goes out.
   SMS_ENABLED: z
     .enum(['true', 'false'])
@@ -69,7 +78,7 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     APP_SECRET: 'test-secret-test-secret-test-secret-0123456789',
     WEBHOOK_SECRET: 'webhook-secret-123456',
     MONDAY_API_TOKEN: 'fake',
-    MONDAY_API_VERSION: '2025-04',
+    MONDAY_API_VERSION: '2026-10',
     MONDAY_INTEGRATION_USER_ID: '999',
     MONDAY_SIGNING_SECRET: undefined,
     HIGHLEVEL_API_TOKEN: 'fake',
@@ -77,6 +86,9 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     HIGHLEVEL_API_VERSION: '2021-07-28',
     HIGHLEVEL_EMAIL_FROM: 'claims@claims.test',
     HIGHLEVEL_EMAIL_FROM_NAME: 'Home Delivery Claims',
+    HIGHLEVEL_SETTLEMENT_TEMPLATE_ID: 'tmpl_settlement',
+    HIGHLEVEL_USER_ID: 'user_hl',
+    HIGHLEVEL_WEBHOOK_PUBLIC_KEY: 'MCowBQYDK2VwAyEAi2HR1srL4o18O8BRa7gVJY7G7bupbN3H9AwJrHCDiOg=',
     SMS_ENABLED: true,
     ADMIN_USER: 'admin',
     ADMIN_PASSWORD_HASH: 'scrypt$unset$unset',

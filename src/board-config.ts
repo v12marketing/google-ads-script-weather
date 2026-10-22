@@ -41,15 +41,25 @@ const BoardConfigSchema = z.object({
   // Monday WorkForm on the private finance board, pre-filled with the claim number.
   paymentForm: z.object({
     url: z.url(),
-    // Query parameter name that pre-fills the claim number question.
+    // WorkForm pre-fill "lookup" names (set per question in the form editor; only
+    // short-text questions pre-fill reliably).
     claimNumberParam: z.string(),
+    // Hidden question carrying an HMAC of the claim number, so an edited link
+    // can't attach bank details to someone else's claim unnoticed.
+    signatureParam: z.string(),
   }),
   // Optional: the payment details board. The integration only ever reads the
-  // claim-number column from it, to mark "payment details received" on the portal.
+  // claim-number and signature columns from it, never the bank details, and
+  // writes a verification label so finance can see the submission is genuine.
   paymentBoard: z
     .object({
       boardId: z.string(),
       claimNumberColumn: z.string(),
+      signatureColumn: z.string(),
+      // Status column the integration sets to verifiedLabel / mismatchLabel.
+      verificationColumn: z.string(),
+      verifiedLabel: z.string().default('Verified'),
+      mismatchLabel: z.string().default('Check claim number'),
     })
     .optional(),
   // An update on the item that starts with this prefix is sent to the claimant.

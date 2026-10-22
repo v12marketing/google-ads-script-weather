@@ -33,11 +33,16 @@
   },
   "paymentForm": {
     "url": "https://forms.monday.com/forms/paymentform?r=use1",
-    "claimNumberParam": "text_claim_number"
+    "claimNumberParam": "claim",
+    "signatureParam": "ref"
   },
   "paymentBoard": {
     "boardId": "2234567890",
-    "claimNumberColumn": "text_claim_number"
+    "claimNumberColumn": "text_claim_number",
+    "signatureColumn": "text_ref",
+    "verificationColumn": "status_verification",
+    "verifiedLabel": "Verified",
+    "mismatchLabel": "Check claim number"
   },
   "claimantMessagePrefix": "To claimant:",
   "notifyUserIds": ["111", "222"]

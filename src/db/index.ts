@@ -16,6 +16,8 @@ const MIGRATIONS: string[] = [
     email TEXT,
     phone TEXT,
     sms_opt_in INTEGER NOT NULL DEFAULT 0,
+    -- Claimant texted STOP; HighLevel blocks SMS until they text START.
+    sms_opted_out INTEGER NOT NULL DEFAULT 0,
     status_key TEXT,
     status_label TEXT,
     amount_claimed REAL,
@@ -25,6 +27,9 @@ const MIGRATIONS: string[] = [
     token_hash TEXT NOT NULL UNIQUE,
     settlement_sent_at TEXT,
     settlement_document_id TEXT,
+    settlement_reference_id TEXT,
+    -- Amount on the document actually sent, so a signature on a superseded amount is caught.
+    settlement_amount_sent REAL,
     settlement_signed_at TEXT,
     payment_details_received_at TEXT,
     received_at TEXT NOT NULL,
@@ -32,6 +37,7 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX claims_email ON claims(lower(email));
   CREATE INDEX claims_contact ON claims(highlevel_contact_id);
+  CREATE INDEX claims_settlement_doc ON claims(settlement_document_id);
 
   CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

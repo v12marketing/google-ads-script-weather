@@ -6,7 +6,7 @@ export function parseHighLevelWebhook(_body: unknown): HighLevelEvent | null {
   return null;
 }
 
-// Verifies HighLevel's x-wh-signature over the raw body, when present.
-export function verifyHighLevelSignature(_rawBody: string, _signature: string | undefined): boolean {
-  return true;
+// Verifies HighLevel's Ed25519 x-ghl-signature over the raw body.
+export function verifyHighLevelSignature(_rawBody: string, _signature: string | undefined, _publicKey: string): boolean {
+  return false;
 }

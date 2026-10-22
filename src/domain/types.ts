@@ -22,6 +22,8 @@ export interface Claim {
   email: string | null;
   phone: string | null; // E.164 when known
   smsOptIn: boolean;
+  // Texted STOP. HighLevel blocks SMS to them until they text START; we fall back to email.
+  smsOptedOut: boolean;
   statusKey: StatusKey | null;
   statusLabel: string | null;
   amountClaimed: number | null;
@@ -31,6 +33,8 @@ export interface Claim {
   tokenVersion: number;
   // Stage flags the portal uses to show settlement/payment steps.
   settlementSentAt: string | null;
+  // Amount on the settlement document that was sent (may differ from the board if it changed since).
+  settlementAmountSent: number | null;
   settlementSignedAt: string | null;
   paymentDetailsReceivedAt: string | null;
   receivedAt: string; // ISO timestamp

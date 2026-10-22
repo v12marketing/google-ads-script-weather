@@ -42,11 +42,27 @@ export interface HighLevelApi {
   removeTags(contactId: string, tags: string[]): Promise<void>;
   sendEmail(input: SendEmailInput): Promise<{ messageId: string | null }>;
   sendSms(input: SendSmsInput): Promise<{ messageId: string | null }>;
-  // Starts the e-signature of the settlement document. Returns a reference to the
-  // document when the API gives one; completion arrives as a webhook.
-  requestSettlementSignature(req: SettlementRequest): Promise<{ documentId: string | null }>;
-  // Downloads the signed document as PDF.
-  downloadSignedDocument(documentId: string): Promise<{ data: Buffer; name: string }>;
+  // Sends the settlement template (POST /proposals/templates/send) after writing
+  // claim_number / settlement_amount to the contact's custom fields. The two ids
+  // are both kept because HighLevel's identifier format is ambiguous.
+  requestSettlementSignature(req: SettlementRequest): Promise<{ documentId: string | null; referenceId: string | null }>;
+  // Checks the document via GET /proposals/document. Signed only when the status
+  // is completed, it is not expired/deleted, and every signer (including this
+  // contact) has hasCompleted + signedDate — staff can "Mark as Completed" in the
+  // UI without signatures. The signed PDF is NOT available through the API.
+  verifySignedDocument(
+    ref: { documentId: string | null; referenceId: string | null },
+    contactId: string,
+  ): Promise<SignedDocumentCheck>;
+}
+
+export interface SignedDocumentCheck {
+  signed: boolean;
+  // Why not signed: 'not_found' | 'not_completed' | 'expired' | 'missing_signatures' | ...
+  reason: string | null;
+  signedAt: string | null;
+  signerIp: string | null;
+  documentName: string | null;
 }
 
 // Normalised inbound events from HighLevel webhooks.
@@ -61,9 +77,15 @@ export type HighLevelEvent =
       subject: string | null;
     }
   | {
+      // From the "Documents & Contracts: Completed" workflow's Webhook action, which
+      // carries contact data, not the document; the service verifies via the API.
       kind: 'document_signed';
       contactId: string | null;
-      documentId: string;
-      // Claim number recovered from the document / contact custom field, if present.
+      documentId: string | null;
+      claimNumber: string | null;
+    }
+  | {
+      kind: 'document_declined';
+      contactId: string | null;
       claimNumber: string | null;
     };

@@ -1,4 +1,4 @@
-import type { ContactInput, HighLevelApi, SendEmailInput, SendSmsInput, SettlementRequest } from './types.js';
+import type { ContactInput, HighLevelApi, SendEmailInput, SendSmsInput, SettlementRequest, SignedDocumentCheck } from './types.js';
 
 // Records everything sent through HighLevel so tests can assert on it.
 export class FakeHighLevel implements HighLevelApi {
@@ -6,7 +6,8 @@ export class FakeHighLevel implements HighLevelApi {
   emails: SendEmailInput[] = [];
   sms: SendSmsInput[] = [];
   settlementRequests: SettlementRequest[] = [];
-  signedDocuments = new Map<string, Buffer>();
+  // documentId -> state; tests flip `signed` to simulate the claimant signing.
+  documents = new Map<string, { contactId: string; signed: boolean; signedAt: string | null }>();
   calls: Array<{ method: string; args: unknown[] }> = [];
   failNext = 0;
   private nextId = 1;
@@ -63,18 +64,34 @@ export class FakeHighLevel implements HighLevelApi {
     return { messageId: `msg_${this.nextId++}` };
   }
 
-  async requestSettlementSignature(req: SettlementRequest): Promise<{ documentId: string | null }> {
+  async requestSettlementSignature(req: SettlementRequest): Promise<{ documentId: string | null; referenceId: string | null }> {
     this.maybeFail('requestSettlementSignature', [req]);
     this.settlementRequests.push(req);
     const documentId = `doc_${this.nextId++}`;
-    this.signedDocuments.set(documentId, Buffer.from(`%PDF-1.4 signed settlement ${req.claimNumber}`));
-    return { documentId };
+    this.documents.set(documentId, { contactId: req.contactId, signed: false, signedAt: null });
+    return { documentId, referenceId: `ref_${documentId}` };
   }
 
-  async downloadSignedDocument(documentId: string): Promise<{ data: Buffer; name: string }> {
-    this.maybeFail('downloadSignedDocument', [documentId]);
-    const data = this.signedDocuments.get(documentId);
-    if (!data) throw new Error(`FakeHighLevel: no document ${documentId}`);
-    return { data, name: 'signed-settlement.pdf' };
+  // Test helper: the claimant signs the most recent document sent to them.
+  sign(documentId?: string): string {
+    const id = documentId ?? [...this.documents.keys()].pop();
+    const d = id ? this.documents.get(id) : undefined;
+    if (!id || !d) throw new Error('FakeHighLevel: no document to sign');
+    d.signed = true;
+    d.signedAt = new Date().toISOString();
+    return id;
+  }
+
+  async verifySignedDocument(
+    ref: { documentId: string | null; referenceId: string | null },
+    contactId: string,
+  ): Promise<SignedDocumentCheck> {
+    this.maybeFail('verifySignedDocument', [ref, contactId]);
+    const id = ref.documentId ?? ref.referenceId?.replace(/^ref_/, '') ?? '';
+    const d = this.documents.get(id);
+    if (!d) return { signed: false, reason: 'not_found', signedAt: null, signerIp: null, documentName: null };
+    if (d.contactId !== contactId) return { signed: false, reason: 'wrong_signer', signedAt: null, signerIp: null, documentName: null };
+    if (!d.signed) return { signed: false, reason: 'not_completed', signedAt: null, signerIp: null, documentName: null };
+    return { signed: true, reason: null, signedAt: d.signedAt, signerIp: '203.0.113.7', documentName: 'Settlement Agreement' };
   }
 }
