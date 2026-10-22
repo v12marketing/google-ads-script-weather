@@ -1,0 +1,71 @@
+# HomeDeliveryClaims.com: the app behind Caddy (automatic HTTPS).
+#
+# Run from this directory (paths below are relative to it):
+#   cd deploy && docker compose up -d --build
+#
+# Needs, in the repository root: .env (copy .env.example) and config/board.json
+# (copy config/board.example.json). See docs/SETUP.md.
+
+name: hdc
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hdc-app:latest
+    restart: unless-stopped
+    init: true
+    env_file: ../.env
+    # These win over .env, so a value meant for local development can't move the
+    # database out of the volume.
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      DATA_DIR: /data
+      BOARD_CONFIG_PATH: /app/config/board.json
+    volumes:
+      - hdc_data:/data
+      - type: bind
+        source: ../config/board.json
+        target: /app/config/board.json
+        read_only: true
+        bind:
+          # Fail loudly if board.json is missing instead of mounting an empty directory.
+          create_host_path: false
+    # Only Caddy talks to the app; port 3000 is not published on the host.
+    expose:
+      - "3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  # Claims database and cached files. Back this up (docs/SETUP.md).
+  hdc_data:
+    name: hdc_data
+  # Caddy's certificates and ACME account.
+  caddy_data:
+  caddy_config:

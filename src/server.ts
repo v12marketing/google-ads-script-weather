@@ -9,9 +9,19 @@ import { HighLevelClient } from './adapters/highlevel/client.js';
 import { DiskFileStore } from './services/storage.js';
 import { JOB } from './services/contracts.js';
 
-const config = loadConfig();
+// Bad or missing settings stop the process at once with a readable message.
+function loadSettings() {
+  try {
+    const config = loadConfig();
+    return { config, board: loadBoardConfig(config.BOARD_CONFIG_PATH) };
+  } catch (err) {
+    console.error(`Startup failed. ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+const { config, board } = loadSettings();
 const log = pino({ level: config.LOG_LEVEL });
-const board = loadBoardConfig(config.BOARD_CONFIG_PATH);
 
 const ctx = buildContext({
   config,

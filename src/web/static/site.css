@@ -1,7 +1,8 @@
 /* Home Delivery Claims — base styles. Mobile-first; most claimants are on a phone.
    Shared component vocabulary: .btn .btn-primary .btn-secondary .card .alert
    (.alert-info .alert-success .alert-error) .field .muted .stack .lead .badge
-   .page-title .grid-2 */
+   .page-title .grid-2
+   Public site: .hero .steps .section .callout .checklist .timeline .faq .prose .cta-band */
 
 :root {
   --ink: #12233a;
@@ -9,6 +10,10 @@
   --brand: #0b3d5c;
   --brand-ink: #ffffff;
   --accent: #0f8f84;
+  /* Darker teals for text and white-on-teal buttons (WCAG AA, 4.5:1 or better). */
+  --accent-strong: #0c7a70;
+  --accent-deeper: #095f57;
+  --accent-text: #0b6b63;
   --accent-soft: #e3f4f2;
   --bg: #ffffff;
   --bg-soft: #f4f7fa;
@@ -19,7 +24,8 @@
   --success-soft: #e6f6ee;
   --info-soft: #e8f1fb;
   --radius: 10px;
-  --focus: 0 0 0 3px rgba(15, 143, 132, 0.45);
+  /* White gap + solid ring: visible on light and dark backgrounds. */
+  --focus: 0 0 0 2px #fff, 0 0 0 5px var(--accent-strong);
   color-scheme: light;
 }
 
@@ -34,7 +40,8 @@ body {
 img { max-width: 100%; height: auto; }
 a { color: var(--brand); }
 a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
-  outline: none;
+  /* Transparent outline still shows in Windows high-contrast mode, where shadows don't. */
+  outline: 3px solid transparent;
   box-shadow: var(--focus);
   border-radius: 4px;
 }
@@ -50,7 +57,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visib
 .site-nav a { color: #d6e4ef; text-decoration: none; font-size: 0.95rem; padding: 4px 0; }
 .site-nav a:hover, .site-nav a[aria-current="page"] { color: #fff; text-decoration: underline; text-underline-offset: 4px; }
 
-main.wrap { padding-top: 28px; padding-bottom: 56px; min-height: 60vh; }
+main.wrap { padding-top: 28px; padding-bottom: 56px; min-height: 60vh; overflow-wrap: break-word; }
 .site-footer { border-top: 1px solid var(--line); background: var(--bg-soft); color: var(--ink-soft); font-size: 0.9rem; padding: 20px 0; }
 .site-footer p { margin: 6px 0 0; }
 
@@ -74,8 +81,8 @@ h3 { font-size: 1.05rem; margin: 20px 0 6px; }
   min-height: 44px; padding: 10px 18px; border-radius: 8px; border: 1px solid transparent;
   font: inherit; font-weight: 600; text-decoration: none; cursor: pointer;
 }
-.btn-primary { background: var(--accent); color: #fff; }
-.btn-primary:hover { background: #0c7a70; }
+.btn-primary { background: var(--accent-strong); color: #fff; }
+.btn-primary:hover { background: var(--accent-deeper); }
 .btn-secondary { background: #fff; color: var(--brand); border-color: var(--line); }
 .btn-secondary:hover { border-color: var(--brand); }
 .btn[disabled] { opacity: 0.6; cursor: not-allowed; }
@@ -95,10 +102,149 @@ textarea { min-height: 120px; resize: vertical; }
 .alert-success { background: var(--success-soft); border-color: #b7e4cb; color: var(--success); }
 .alert-error { background: var(--error-soft); border-color: #f5c2bd; color: var(--error); }
 
-.badge { display: inline-block; padding: 2px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-weight: 600; font-size: 0.85rem; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-text); font-weight: 600; font-size: 0.85rem; }
 
 details { border: 1px solid var(--line); border-radius: var(--radius); padding: 0 14px; margin-bottom: 10px; background: #fff; }
 details > summary { cursor: pointer; font-weight: 600; padding: 12px 0; }
 details[open] > summary { border-bottom: 1px solid var(--line); margin-bottom: 8px; }
 
-@media print { .site-header, .site-footer, .btn { display: none; } }
+/* ---- Header and footer polish ---- */
+.brand { display: inline-flex; align-items: center; gap: 10px; }
+.brand::before {
+  content: ""; flex: none; width: 30px; height: 30px; border-radius: 7px;
+  background: url("/static/favicon.svg") center / cover no-repeat;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+.site-header a:focus-visible { box-shadow: 0 0 0 3px #fff; }
+.site-footer { padding: 28px 0 32px; }
+.site-footer nav a { display: inline-block; padding: 6px 2px; color: var(--ink); text-decoration: none; }
+.site-footer nav a:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+/* ---- Shared helpers ---- */
+.icon { width: 1.25em; height: 1.25em; flex: none; vertical-align: -0.22em; }
+.visually-hidden {
+  position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+/* Bot trap on forms: off-screen, never focusable. */
+.hp { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+.narrow { max-width: 560px; }
+.section { margin-top: 48px; }
+.section > h2:first-child { margin-top: 0; }
+.section-lead { color: var(--ink-soft); margin: -2px 0 20px; max-width: 62ch; }
+.eyebrow { margin: 0 0 8px; color: var(--accent-text); font-size: 0.85rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.btn-lg { min-height: 52px; padding: 12px 24px; font-size: 1.05rem; }
+.btn-on-dark { background: transparent; color: #fff; border-color: rgba(255, 255, 255, 0.7); }
+.btn-on-dark:hover { background: rgba(255, 255, 255, 0.12); border-color: #fff; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0 12px; }
+.actions .btn { flex: 1 1 200px; }
+.actions-center { justify-content: center; }
+@media (min-width: 720px) { .actions .btn { flex: 0 0 auto; } }
+input[aria-invalid="true"] { border-color: var(--error); border-width: 2px; }
+
+/* ---- Home hero ---- */
+.hero {
+  display: grid; gap: 24px; align-items: center;
+  padding: 28px 20px; border-radius: 16px;
+  background: linear-gradient(160deg, var(--info-soft) 0%, var(--accent-soft) 100%);
+}
+.hero h1 { font-size: clamp(1.85rem, 7vw, 2.7rem); letter-spacing: -0.01em; margin-bottom: 14px; }
+.hero .lead { color: var(--ink); max-width: 46ch; }
+.hero-text > :last-child { margin-bottom: 0; }
+.hero-art { display: none; }
+.hero-art svg { display: block; width: 100%; max-width: 340px; height: auto; margin-left: auto; }
+@media (min-width: 720px) {
+  .hero { grid-template-columns: 1.3fr 1fr; padding: 44px 40px; }
+  .hero-art { display: block; }
+}
+
+/* ---- How it works: three steps ---- */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 16px; }
+@media (min-width: 720px) { .steps { grid-template-columns: repeat(3, 1fr); } }
+.step { position: relative; padding: 20px 18px; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); }
+.step h3 { margin: 14px 0 6px; }
+.step p { margin: 0; color: var(--ink-soft); }
+.step-icon {
+  display: inline-grid; place-items: center; width: 46px; height: 46px;
+  border-radius: 12px; background: var(--accent-soft); color: var(--accent-text);
+}
+.step-icon .icon { width: 26px; height: 26px; }
+.step-num { position: absolute; top: 20px; right: 18px; color: var(--ink-soft); font-size: 0.85rem; font-weight: 600; }
+
+/* ---- Checklists and callouts ---- */
+.checklist { list-style: none; margin: 0; padding: 0; }
+.checklist li { display: flex; gap: 10px; align-items: flex-start; padding: 5px 0; }
+.checklist .icon { margin-top: 0.2em; color: var(--accent-strong); }
+.callout {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 18px; border-radius: var(--radius);
+  background: var(--info-soft); border: 1px solid #c3d9f2;
+}
+.callout-icon { width: 28px; height: 28px; margin-top: 2px; color: var(--brand); }
+.callout h2, .callout h3 { margin-top: 0; }
+.callout > div > :last-child { margin-bottom: 0; }
+.heading-icon { color: var(--accent-text); margin-right: 4px; }
+
+/* ---- Start a claim: embedded form ---- */
+.claim-form-shell { overflow: hidden; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); }
+/* The form can't report its height, so leave room for its longest (phone) layout. */
+.claim-form-frame { display: block; width: 100%; height: 1900px; border: 0; }
+@media (min-width: 720px) { .claim-form-frame { height: 1500px; } }
+.frame-fallback { margin: 10px 0 0; }
+
+/* ---- Claim stages timeline ---- */
+.timeline { list-style: none; margin: 0; padding: 0; }
+.timeline > li { position: relative; padding: 0 0 20px 38px; }
+.timeline > li::before {
+  content: ""; position: absolute; left: 6px; top: 6px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; border: 3px solid var(--accent-strong);
+}
+.timeline > li::after { content: ""; position: absolute; left: 13px; top: 26px; bottom: 2px; width: 2px; background: var(--line); }
+.timeline > li:last-child { padding-bottom: 0; }
+.timeline > li:last-child::after { display: none; }
+.timeline > li.end::before { border-color: var(--ink-soft); }
+.timeline h3 { margin: 0 0 4px; }
+.timeline p { margin: 0; color: var(--ink-soft); }
+
+/* ---- FAQ ---- */
+.faq details { padding: 0; }
+.faq summary {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 16px; list-style: none;
+}
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::after { content: "+"; flex: none; color: var(--accent-text); font-size: 1.4rem; font-weight: 400; line-height: 1; }
+.faq details[open] > summary::after { content: "\2212"; }
+.faq details[open] > summary { margin-bottom: 0; }
+.faq .answer { padding: 12px 16px 4px; }
+.faq .answer ul { padding-left: 1.25em; }
+
+/* ---- Legal pages ---- */
+.prose { max-width: 72ch; }
+.prose h2 { margin-top: 36px; }
+.prose ul { padding-left: 1.25em; }
+.prose li + li { margin-top: 6px; }
+.meta { color: var(--ink-soft); font-size: 0.95rem; margin-top: -4px; }
+
+/* ---- Closing call to action ---- */
+.cta-band { margin-top: 56px; padding: 32px 20px; border-radius: 16px; background: var(--brand); color: #fff; text-align: center; }
+.cta-band h2 { margin: 0 0 8px; color: #fff; }
+.cta-band p { margin: 0 auto; max-width: 52ch; color: #d6e4ef; }
+.cta-band .actions { margin-bottom: 0; }
+
+/* ---- Find my claim and error pages ---- */
+.sent-alert { display: flex; gap: 10px; align-items: flex-start; }
+.sent-alert p { margin: 0; }
+.sent-alert .icon { margin-top: 0.2em; }
+.error-page { max-width: 640px; padding-top: 8px; }
+.error-code { margin: 0 0 6px; color: var(--accent-text); font-size: 0.85rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+
+/* ---- Motion ---- */
+@media (prefers-reduced-motion: no-preference) {
+  .btn, .site-nav a, .faq summary::after { transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
+
+@media print { .site-header, .site-footer, .btn, .hero-art, .cta-band { display: none; } }

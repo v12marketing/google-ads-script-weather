@@ -3,11 +3,14 @@
   "version": "0.1.0",
   "description": "HomeDeliveryClaims.com — claimant site, portal and Monday.com integration",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
     "start": "node dist/src/server.js",
-    "build": "tsc -p tsconfig.json && rm -rf dist/src/web/static && cp -r src/web/static dist/src/web/static",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && rm -rf dist/src/web/static && cp -r src/web/static dist/src/web/static",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "hash-password": "tsx scripts/hash-password.ts",
+    "monday:setup": "tsx scripts/monday-setup.ts",
+    "highlevel:setup": "tsx scripts/highlevel-setup.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.3",

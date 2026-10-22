@@ -75,7 +75,18 @@ export function parseBoardConfig(raw: unknown): BoardConfig {
 }
 
 export function loadBoardConfig(path: string): BoardConfig {
-  return parseBoardConfig(JSON.parse(readFileSync(path, 'utf8')));
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    throw new Error(`Board config ${path} could not be read: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const parsed = BoardConfigSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`).join('\n');
+    throw new Error(`Invalid board config ${path}:\n${issues}`);
+  }
+  return parsed.data;
 }
 
 // Status label -> key, case- and whitespace-insensitive.

@@ -1,0 +1,42 @@
+# Caddy in front of the app: HTTPS certificates (Let's Encrypt, automatic),
+# compression, upload size limit and security headers.
+#
+# No access log on purpose: request URLs carry claimants' private claim links
+# (/c/<token>) and the webhook secret (/webhooks/.../<secret>).
+
+# Optional: to get emails from Let's Encrypt about certificate problems, add
+# this global options block at the very top of the file:
+# {
+# 	email ops@homedeliveryclaims.com
+# }
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Defaults only: the app sets its own per page (e.g. the admin pages
+		# need a same-origin referrer policy for their forms).
+		?X-Content-Type-Options "nosniff"
+		?X-Frame-Options "DENY"
+		?Referrer-Policy "no-referrer"
+		?Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		-Server
+		-X-Powered-By
+	}
+}
+
+homedeliveryclaims.com {
+	import security_headers
+	encode zstd gzip
+
+	# Claimant uploads are limited by the app too (MAX_UPLOAD_BYTES per file).
+	request_body {
+		max_size 30MB
+	}
+
+	reverse_proxy app:3000
+}
+
+www.homedeliveryclaims.com {
+	import security_headers
+	redir https://homedeliveryclaims.com{uri} permanent
+}

@@ -219,6 +219,18 @@ export class Repo {
     })();
   }
 
+  // Replaces the claim's private link: bumps tokenVersion, stores the new link's
+  // hash and forgets every trusted browser, atomically.
+  rotatePortalToken(itemId: string, tokenHashFor: (itemId: string, tokenVersion: number) => string): Claim | null {
+    return this.db.transaction(() => {
+      const c = this.getClaim(itemId);
+      if (!c) return null;
+      const tokenVersion = c.tokenVersion + 1;
+      this.db.prepare('DELETE FROM devices WHERE item_id = ?').run(itemId);
+      return this.updateClaim(itemId, { tokenVersion, tokenHash: tokenHashFor(itemId, tokenVersion) });
+    })();
+  }
+
   updateClaim(itemId: string, patch: ClaimPatch): Claim | null {
     const sets: string[] = [];
     const vals: unknown[] = [];
@@ -267,8 +279,11 @@ export class Repo {
     return r ? toMessage(r) : null;
   }
 
-  hasMondayUpdate(mondayUpdateId: string): boolean {
-    return !!this.db.prepare('SELECT 1 FROM messages WHERE monday_update_id = ?').get(mondayUpdateId);
+  getMessageByMondayUpdateId(mondayUpdateId: string): ClaimMessage | null {
+    const r = this.db.prepare('SELECT * FROM messages WHERE monday_update_id = ?').get(mondayUpdateId) as
+      | Record<string, unknown>
+      | undefined;
+    return r ? toMessage(r) : null;
   }
 
   listMessages(itemId: string): ClaimMessage[] {
@@ -320,7 +335,7 @@ export class Repo {
     this.db.prepare('DELETE FROM files WHERE id = ?').run(id);
   }
 
-  // --- templates (overrides only; defaults live in domain/templates.ts) ---
+  // --- templates (overrides only; defaults live in services/templates.ts) ---
 
   getTemplateOverride(key: TemplateKey): MessageTemplate | null {
     const r = this.db.prepare('SELECT * FROM templates WHERE key = ?').get(key) as Record<string, string> | undefined;
@@ -351,6 +366,11 @@ export class Repo {
   }
 
   // --- idempotency ---
+
+  // Read-only check, for "do X once" steps that must record the key only after X succeeds.
+  isEventProcessed(eventKey: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM processed_events WHERE event_key = ?').get(eventKey);
+  }
 
   // True the first time a key is seen, false on every repeat.
   markEventProcessed(eventKey: string): boolean {

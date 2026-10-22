@@ -132,14 +132,18 @@ export interface FileService {
 export interface AuthService {
   // Device trust for the portal (one-time code to the claim's email).
   isDeviceTrusted(claim: Claim, deviceId: string | undefined): boolean;
-  // Sends a code; returns false if rate-limited. deviceId binds the code to this browser.
+  // Sends a code; returns sent=false if rate-limited (or the claim has no email).
+  // deviceId binds the code to this browser. Throws when the email can't be
+  // delivered; the code is discarded first, so it neither works nor counts.
   sendLoginCode(claim: Claim, deviceId: string): Promise<{ sent: boolean; maskedEmail: string }>;
   verifyLoginCode(claim: Claim, deviceId: string, code: string, userAgent?: string): 'ok' | 'invalid' | 'expired' | 'locked';
   newDeviceId(): string;
   csrfToken(deviceId: string, itemId: string): string;
   checkCsrf(deviceId: string, itemId: string, token: string | undefined): boolean;
   // "Find my claim": emails links for every claim on the address. Always resolves
-  // the same way whether or not the email is known.
+  // the same way whether or not the email is known, and before the email is
+  // delivered (it is sent in the background; failures are logged), so response
+  // time reveals nothing. In-process fakes have sent it by the time it resolves.
   sendClaimLinks(email: string): Promise<void>;
 }
 

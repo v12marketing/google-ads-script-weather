@@ -1,0 +1,5 @@
+{
+  // Production build: the service and the setup scripts (run as node dist/scripts/*.js), no tests.
+  "extends": "./tsconfig.json",
+  "include": ["src", "scripts"]
+}

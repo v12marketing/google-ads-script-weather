@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import formbody from '@fastify/formbody';
 import multipart from '@fastify/multipart';
@@ -17,11 +17,41 @@ const here = dirname(fileURLToPath(import.meta.url));
 // build step copies them (see package.json "build").
 export const STATIC_DIR = join(here, 'static');
 
+// URLs carry the claim's private token (/c/<token>) and the webhook secret
+// (/webhooks/<source>/<secret>): never log them, nor any query string.
+export function redactUrl(url: string): string {
+  return (url.split('?')[0] ?? '')
+    .replace(/^\/c\/[^/]+/, '/c/[redacted]')
+    .replace(/^\/webhooks\/([^/]+)\/[^/]+/, '/webhooks/$1/[redacted]');
+}
+
+// Fastify's own per-request lines print the raw URL; ours (onResponse below) are
+// redacted. Error lines stay, and serialise `req` through redactUrl.
+class RedactingLogController extends LogController {
+  override incomingRequest(): void {}
+  override routeNotFound(): void {}
+  override requestCompleted(error: Error | null | undefined, req: FastifyRequest, reply: FastifyReply): void {
+    if (error) super.requestCompleted(error, req, reply);
+  }
+}
+
 export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: ctx.config.NODE_ENV === 'test' ? false : { level: ctx.config.LOG_LEVEL },
+    logger:
+      ctx.config.NODE_ENV === 'test'
+        ? false
+        : { level: ctx.config.LOG_LEVEL, serializers: { req: (req: { method?: string; url?: string }) => ({ method: req.method, url: redactUrl(req.url ?? '') }) } },
+    logController: new RedactingLogController(),
     trustProxy: true,
     bodyLimit: 1024 * 1024,
+  });
+
+  app.addHook('onResponse', async (req, reply) => {
+    if (reply.statusCode < 400 && (req.url === '/healthz' || req.url.startsWith('/static/'))) return;
+    req.log.info(
+      { method: req.method, url: redactUrl(req.url), statusCode: reply.statusCode, ms: Math.round(reply.elapsedTime) },
+      'request completed',
+    );
   });
 
   await app.register(cookie, { secret: ctx.config.APP_SECRET });

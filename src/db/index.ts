@@ -125,6 +125,17 @@ const MIGRATIONS: string[] = [
   );
   INSERT INTO claim_number_seq (id, last) VALUES (1, 0);
   `,
+  `
+  -- Rate-limit bookkeeping for unauthenticated portal actions ("find my claim").
+  -- subject_hash is an HMAC of the subject (an email address), never the value itself.
+  CREATE TABLE auth_rate_events (
+    kind TEXT NOT NULL,
+    subject_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX auth_rate_events_lookup ON auth_rate_events(kind, subject_hash, created_at);
+  CREATE INDEX login_codes_device ON login_codes(item_id, device_hash, id);
+  `,
 ];
 
 export function openDb(dataDir: string): Db {
