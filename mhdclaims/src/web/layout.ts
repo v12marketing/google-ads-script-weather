@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { html, raw, type Html } from './html.js';
 import { SITE } from './site-info.js';
 
@@ -19,6 +21,25 @@ export interface PageOptions {
   path?: string;
 }
 
+// /static/ is cached for a day (app.ts), so each page links its assets with a hash of
+// their contents: a deploy that changes a file changes its URL. Hashed once per file in
+// production; re-read on every render otherwise, so edits under `tsx watch` show at once.
+// Fonts stay unversioned: site.css requests them by plain URL, and the preloads must match.
+const STATIC_ROOT = new URL('./static/', import.meta.url); // src/web/static, or dist/src/web/static after build
+const versions = new Map<string, string>();
+function asset(path: string): string {
+  let v = process.env.NODE_ENV === 'production' ? versions.get(path) : undefined;
+  if (v === undefined) {
+    try {
+      v = createHash('sha256').update(readFileSync(new URL(path, STATIC_ROOT))).digest('hex').slice(0, 8);
+    } catch {
+      v = '';
+    }
+    versions.set(path, v);
+  }
+  return v ? `/static/${path}?v=${v}` : `/static/${path}`;
+}
+
 const NAV: Array<[string, string]> = [
   ['/start-a-claim', 'Start a claim'],
   ['/how-it-works', 'How it works'],
@@ -38,19 +59,19 @@ export function page(o: PageOptions): string {
 ${o.description ? html`<meta name="description" content="${o.description}">` : ''}
 ${o.noindex ? raw('<meta name="robots" content="noindex, nofollow">') : ''}
 <meta name="theme-color" content="#02244d">
-<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
+<link rel="icon" href="${asset('favicon.svg')}" type="image/svg+xml">
+<link rel="apple-touch-icon" href="${asset('brand/apple-touch-icon.png')}">
 <link rel="preload" href="/static/fonts/open-sans-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/static/fonts/montserrat-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="/static/site.css">
-${(o.styles ?? []).map((s) => html`<link rel="stylesheet" href="/static/${s}">`)}
-${(o.scripts ?? []).map((s) => html`<script src="/static/${s}" defer></script>`)}
+<link rel="stylesheet" href="${asset('site.css')}">
+${(o.styles ?? []).map((s) => html`<link rel="stylesheet" href="${asset(s)}">`)}
+${(o.scripts ?? []).map((s) => html`<script src="${asset(s)}" defer></script>`)}
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
   <div class="wrap header-inner">
-    <a class="brand" href="/"><img src="/static/brand/logo.webp" width="505" height="200" alt="${SITE.domain} home"></a>
+    <a class="brand" href="/"><img src="${asset('brand/logo.webp')}" width="505" height="200" alt="${SITE.domain} home"></a>
     ${
       o.minimalHeader
         ? ''

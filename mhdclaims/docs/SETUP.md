@@ -691,15 +691,17 @@ text, and texting STATUS should get a reply.
 - [ ] **Counsel has reviewed** the privacy policy, terms of use (including SMS
       terms), the settlement agreement template and the e-signature consent text,
       and provided the no-voided-check terms for the payment form.
-- [ ] **No placeholders left**: search the site and templates for `[` (legal
-      entity name, mailing address, effective date, retention period, governing
-      law state in `src/web/site-info.ts`; the bracketed items in
-      `docs/templates/*.md`), and confirm `contactEmail` in `site-info.ts` is the
-      real public mailbox.
-- [ ] The bracketed placeholders on the privacy and terms pages (legal entity name,
-      mailing address, effective date, retention period, governing law) are filled
-      in. They live in `src/web/site-info.ts`; ask the developer to update and
+- [ ] **No placeholders left**: search the site and templates for `[` (mailing
+      address, effective date, retention period and governing law state in
+      `src/web/site-info.ts`, shown on the privacy and terms pages; the bracketed
+      items in `docs/templates/*.md`), and confirm `contactEmail` in
+      `site-info.ts` is the real public mailbox. Ask the developer to update and
       redeploy.
+- [ ] The legal name **HomeDeliveryClaims.com LLC** (`legalEntityName` in
+      `src/web/site-info.ts`, taken from the logo) is spelled and punctuated
+      exactly as on the formation documents and the IRS letter (e.g. "LLC" vs
+      ", LLC"). It is the "we" on the privacy and terms pages, appears in the
+      footer, and must match the 10DLC brand registration (section 10).
 - [ ] `monday-setup.js check` and `highlevel-setup.js check` both pass.
 - [ ] `claims@homedeliveryclaims.com` receives mail sent from outside (section 3)
       and someone reads it every working day. (To show a different address on

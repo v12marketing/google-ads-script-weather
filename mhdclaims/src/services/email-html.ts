@@ -7,8 +7,8 @@ import { escapeHtml, html, raw, type Html } from '../web/html.js';
 // we know what it is. Any other URL stays plain text, so text that came from a
 // claimant can't turn into a clickable link in an email from us.
 
+// Also the logo's alt text: spaced words wrap inside the image box when images are off.
 const BRAND = 'Home Delivery Claims';
-const LOGO_ALT = 'HomeDeliveryClaims.com';
 // Web fonts are unreliable in email clients; Open Sans shows where installed.
 const FONT = raw("'Open Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif");
 // Brand colors from the logo, as on the site.
@@ -21,6 +21,10 @@ const BUTTON_BG = '#0f71b9';
 const LINK = '#0b5f9e';
 const PAGE_BG = '#f5f8fc';
 const LINE = '#dde5ef';
+// email-logo.png carries its own white margin (10px at 220px wide), so dark-mode clients
+// that darken the header show a white badge, not artwork cut off at the edges. The cell
+// gives that 10px back, keeping the artwork where it was and in line with the body text.
+const HEADER_LOGO_PADDING = '10px 32px 6px 22px';
 
 export interface EmailButton {
   url: string;
@@ -101,7 +105,7 @@ const paragraph = (lines: string[], allowed: LinkCheck): Html =>
   html`<p style="margin:0 0 16px;">${lines.map((l, i) => html`${i ? raw('<br>') : ''}${linkify(l, allowed)}`)}</p>`;
 
 const button = (url: string, label: string): Html => html`<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:4px 0 8px;border-collapse:separate;">
-<tr><td align="center" bgcolor="${BUTTON_BG}" style="background:${BUTTON_BG};border-radius:8px;">
+<tr><td align="center" bgcolor="${BUTTON_BG}" style="background:${BUTTON_BG};border-radius:8px;mso-padding-alt:13px 24px;">
 <a href="${url}" style="display:inline-block;padding:13px 24px;font-family:${FONT};font-size:16px;font-weight:600;line-height:1.2;color:#ffffff;text-decoration:none;border-radius:8px;">${label}</a>
 </td></tr>
 </table>
@@ -162,6 +166,7 @@ export function renderEmailHtml(c: EmailContent): string {
 @media only screen and (max-width: 620px) {
   .container { width: 100% !important; }
   .px { padding-left: 20px !important; padding-right: 20px !important; }
+  .px-logo { padding-left: 10px !important; }
 }
 </style>
 </head>
@@ -169,9 +174,9 @@ export function renderEmailHtml(c: EmailContent): string {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${PAGE_BG};">
 <tr><td align="center" style="padding:24px 12px;">
 <table role="presentation" class="container" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px;max-width:600px;background:#ffffff;border:1px solid ${LINE};border-radius:10px;">
-<tr><td class="px" style="background:#ffffff;padding:20px 32px 16px;border-bottom:3px solid ${GOLD};border-radius:10px 10px 0 0;font-family:${FONT};font-size:19px;font-weight:700;letter-spacing:0.01em;color:${NAVY};">${
+<tr><td class="${c.logoUrl ? 'px px-logo' : 'px'}" style="background:#ffffff;padding:${c.logoUrl ? HEADER_LOGO_PADDING : '20px 32px 16px'};border-bottom:3px solid ${GOLD};border-radius:10px 10px 0 0;font-family:${FONT};font-size:19px;font-weight:700;letter-spacing:0.01em;color:${NAVY};">${
       c.logoUrl
-        ? html`<img src="${c.logoUrl}" width="200" height="79" alt="${LOGO_ALT}" style="display:block;width:200px;height:auto;max-width:100%;border:0;">`
+        ? html`<img src="${c.logoUrl}" width="220" height="99" alt="${BRAND}" style="display:block;width:220px;height:auto;max-width:100%;border:0;">`
         : BRAND
     }</td></tr>
 <tr><td class="px" style="padding:28px 32px 12px;font-family:${FONT};font-size:16px;line-height:1.6;color:${INK};">

@@ -14,7 +14,7 @@ export function homePage(): PublicPage {
       'Delivery damaged? File a claim online with photos, follow its progress on your private claim page, and get paid by check or direct deposit.',
     body: html`<section class="hero" aria-labelledby="hero-title">
   <div class="hero-text">
-    <p class="eyebrow">${SITE.deliveryCompanyName ? `For deliveries by ${SITE.deliveryCompanyName}` : 'Delivery damage claims'}</p>
+    <p class="eyebrow">${SITE.deliveryCompanyName ? html`<span>For deliveries by <span class="nowrap">${SITE.deliveryCompanyName}</span></span>` : 'Delivery damage claims'}</p>
     <h1 id="hero-title">Delivery damaged? File a claim online.</h1>
     <p class="lead">Tell us what happened and add a few photos. We'll review your claim, keep you updated by email or
       text, and pay approved claims by check or direct deposit.</p>

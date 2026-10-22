@@ -50,6 +50,9 @@ body {
   background: var(--bg);
   color: var(--ink);
   font: 16px/1.65 var(--font-body);
+  /* Full-height column: main grows so the footer sits at the bottom of short pages. */
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; flex-direction: column;
 }
 img { max-width: 100%; height: auto; }
 a { color: var(--accent-text); }
@@ -78,13 +81,22 @@ a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visib
 }
 .site-nav a:hover { color: var(--accent-text); }
 .site-nav a[aria-current="page"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+/* Contrast themes repaint the transparent border too: underline only the current page. */
+@media (forced-colors: active) {
+  .site-nav a:not([aria-current="page"]) { border-bottom-style: none; padding-bottom: 8px; }
+}
 /* Phones: the four links share one full-width row under the logo. */
 @media (max-width: 719px) {
-  .site-nav { width: 100%; justify-content: space-between; gap: 2px 8px; }
-  .site-nav a { font-size: 0.875rem; }
+  .site-nav { width: 100%; justify-content: space-between; gap: 2px 6px; }
+  .site-nav a { font-size: 0.8125rem; }
+}
+/* Below 360px they can't share one row: two even rows of two. */
+@media (max-width: 359px) {
+  .site-nav { display: grid; grid-template-columns: auto auto; justify-content: space-between; justify-items: start; }
 }
 
-main.wrap { padding-top: 28px; padding-bottom: 56px; min-height: 60vh; overflow-wrap: break-word; }
+/* width: .wrap's auto margins stop the flex item stretching. */
+main.wrap { flex: 1 0 auto; width: 100%; padding-top: 28px; padding-bottom: 56px; overflow-wrap: break-word; }
 .site-footer { border-top: 4px solid var(--gold); background: var(--brand); color: #c9d6e6; font-size: 0.9rem; padding: 20px 0; }
 .site-footer p { margin: 6px 0 0; }
 
@@ -153,6 +165,7 @@ details[open] > summary { border-bottom: 1px solid var(--line); margin-bottom: 8
 /* Bot trap on forms: off-screen, never focusable. */
 .hp { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
 .narrow { max-width: 560px; }
+.nowrap { white-space: nowrap; }
 .section { margin-top: 48px; }
 .section > h2:first-child { margin-top: 0; }
 .section-lead { color: var(--ink-soft); margin: -2px 0 20px; max-width: 62ch; }
@@ -163,7 +176,7 @@ details[open] > summary { border-bottom: 1px solid var(--line); margin-bottom: 8
 .eyebrow::before { content: ""; flex: none; width: 28px; height: 3px; border-radius: 2px; background: var(--gold); }
 .btn-lg { min-height: 52px; padding: 12px 24px; font-size: 1.05rem; }
 .btn-on-dark { background: transparent; color: #fff; border-color: rgba(255, 255, 255, 0.7); }
-.btn-on-dark:hover { background: rgba(255, 255, 255, 0.12); border-color: #fff; }
+.btn-on-dark:hover { background: rgba(255, 255, 255, 0.12); border-color: #fff; color: #fff; }
 .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0 12px; }
 .actions .btn { flex: 1 1 200px; }
 .actions-center { justify-content: center; }
