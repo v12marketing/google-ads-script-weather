@@ -1,0 +1,44 @@
+{
+  "claimsBoardId": "1234567890",
+  "claimsBoardUrl": "https://example.monday.com/boards/1234567890",
+  "columns": {
+    "claimNumber": "text_claim_number",
+    "status": "status",
+    "email": "email_claimant",
+    "phone": "phone_claimant",
+    "smsOptIn": "checkbox_sms",
+    "amountClaimed": "numeric_claimed",
+    "settlementAmount": "numeric_settlement",
+    "dateReceived": "date_received",
+    "intakePhotos": "file_intake_photos",
+    "claimantUploads": "file_claimant_uploads",
+    "signedSettlement": "file_signed_settlement",
+    "portalLink": "text_portal_link"
+  },
+  "sharedFileColumns": ["file_shared_documents", "file_shared_photos"],
+  "statuses": {
+    "New": "received",
+    "Under review": "under_review",
+    "More info needed": "more_info_needed",
+    "Estimate in progress": "estimate_in_progress",
+    "Settlement offered": "settlement_offered",
+    "Settlement signed": "settlement_signed",
+    "Payment sent": "payment_sent",
+    "Closed": "closed",
+    "Denied": "denied"
+  },
+  "settlementSignedLabel": "Settlement signed",
+  "claimForm": {
+    "embedUrl": "https://forms.monday.com/forms/embed/claimform?r=use1"
+  },
+  "paymentForm": {
+    "url": "https://forms.monday.com/forms/paymentform?r=use1",
+    "claimNumberParam": "text_claim_number"
+  },
+  "paymentBoard": {
+    "boardId": "2234567890",
+    "claimNumberColumn": "text_claim_number"
+  },
+  "claimantMessagePrefix": "To claimant:",
+  "notifyUserIds": ["111", "222"]
+}

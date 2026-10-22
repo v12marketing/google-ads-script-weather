@@ -1,0 +1,50 @@
+import Fastify, { type FastifyInstance } from 'fastify';
+import cookie from '@fastify/cookie';
+import formbody from '@fastify/formbody';
+import multipart from '@fastify/multipart';
+import rateLimit from '@fastify/rate-limit';
+import fastifyStatic from '@fastify/static';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import type { AppContext } from '../services/contracts.js';
+import { registerPublicRoutes } from './routes/public.js';
+import { registerPortalRoutes } from './routes/portal.js';
+import { registerWebhookRoutes } from './routes/webhooks.js';
+import { registerAdminRoutes } from './routes/admin.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+// Static assets are read from src/ in dev and from dist/src/ after build; the
+// build step copies them (see package.json "build").
+export const STATIC_DIR = join(here, 'static');
+
+export async function buildApp(ctx: AppContext): Promise<FastifyInstance> {
+  const app = Fastify({
+    logger: ctx.config.NODE_ENV === 'test' ? false : { level: ctx.config.LOG_LEVEL },
+    trustProxy: true,
+    bodyLimit: 1024 * 1024,
+  });
+
+  await app.register(cookie, { secret: ctx.config.APP_SECRET });
+  await app.register(formbody);
+  await app.register(multipart, { limits: { fileSize: ctx.config.MAX_UPLOAD_BYTES, files: 10 } });
+  await app.register(rateLimit, { global: false });
+  await app.register(fastifyStatic, { root: STATIC_DIR, prefix: '/static/', maxAge: '1d' });
+
+  app.addHook('onSend', async (_req, reply, payload) => {
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Referrer-Policy', 'no-referrer');
+    reply.header('X-Frame-Options', 'DENY');
+    if (ctx.config.NODE_ENV === 'production') {
+      reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    return payload;
+  });
+
+  app.get('/healthz', async () => ({ ok: true }));
+
+  await registerPublicRoutes(app, ctx);
+  await registerPortalRoutes(app, ctx);
+  await registerWebhookRoutes(app, ctx);
+  await registerAdminRoutes(app, ctx);
+  return app;
+}
