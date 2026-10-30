@@ -10,8 +10,8 @@ export const SITE = {
   // The company that operates the site and decides claims ("we" in the legal pages),
   // as shown on the logo.
   legalEntityName: 'HomeDeliveryClaims.com LLC',
-  // Placeholder until the client confirms the public contact mailbox.
-  contactEmail: 'claims@homedeliveryclaims.com',
+  // The public contact mailbox.
+  contactEmail: 'support@homedeliveryclaims.com',
   mailingAddress: '[Mailing address: street, city, state, ZIP]',
   // Effective date of the Privacy Policy and Terms of Use.
   effectiveDate: '[Effective date]',

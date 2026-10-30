@@ -39,7 +39,7 @@ one; text messages are switched on at the end.
   on any plan, archive finished claims regularly (section 12). The plan also sets
   the daily API call allowance (about 10,000 a day on Pro, 25,000 on Enterprise).
 - Email hosting for the domain (e.g. Google Workspace or Microsoft 365) with two
-  mailboxes: `claims@homedeliveryclaims.com`, the contact address the site gives
+  mailboxes: `support@homedeliveryclaims.com`, the contact address the site gives
   claimants for help, privacy requests and paper copies (someone must read it
   every working day), and `integration@homedeliveryclaims.com` for the Monday
   integration user (5.1). DNS records for it are in section 3.
@@ -135,7 +135,7 @@ because nothing but Caddy can reach it (its port is never published). Keep it
 that way: don't publish port 3000 or set `trusted_proxies` in the Caddyfile.
 
 **Email for the main domain.** The site tells claimants to write to
-`claims@homedeliveryclaims.com`, so the domain needs working mail before launch.
+`support@homedeliveryclaims.com`, so the domain needs working mail before launch.
 In your email provider, add the domain, create the `claims@` and `integration@`
 mailboxes (and a `dmarc@` alias for the reports below), then add the records the
 provider shows:
@@ -151,7 +151,7 @@ There can be only one SPF record per name: if `@` already has a `v=spf1` TXT
 record, add the include to it. The DMARC record also covers the HighLevel
 sending subdomain from step 6.3; once its reports show your mail passing, you can
 change `p=none` to `p=quarantine`. Test: from a personal address, write to
-`claims@homedeliveryclaims.com`, then reply from the mailbox. Both messages should
+`support@homedeliveryclaims.com`, then reply from the mailbox. Both messages should
 arrive, and not in spam.
 
 The HighLevel sending domain adds more records in step 6.3.
@@ -613,7 +613,7 @@ Don't build workflows for those.
 **D. Optional: HELP reply.** The service ignores HELP. Text HELP to your number
 from a test phone first: if nothing answers, add a workflow (Customer Replied,
 SMS, exact match `HELP`, action Send SMS) with: "Home Delivery Claims: for help
-with your claim, reply with your question or email claims@homedeliveryclaims.com.
+with your claim, reply with your question or email support@homedeliveryclaims.com.
 Reply STOP to opt out." If the carrier already answers, skip it to avoid double
 replies.
 
@@ -703,7 +703,7 @@ text, and texting STATUS should get a reply.
       ", LLC"). It is the "we" on the privacy and terms pages, appears in the
       footer, and must match the 10DLC brand registration (section 10).
 - [ ] `monday-setup.js check` and `highlevel-setup.js check` both pass.
-- [ ] `claims@homedeliveryclaims.com` receives mail sent from outside (section 3)
+- [ ] `support@homedeliveryclaims.com` receives mail sent from outside (section 3)
       and someone reads it every working day. (To show a different address on
       the site, ask the developer to change `contactEmail` in
       `src/web/site-info.ts`.)
