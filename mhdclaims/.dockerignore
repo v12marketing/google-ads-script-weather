@@ -1,0 +1,12 @@
+# Keep secrets, local data and build output out of the Docker build context.
+.env
+.env.*
+!.env.example
+data
+dist
+node_modules
+coverage
+.git
+config/board.json
+*.sqlite
+*.sqlite-*
